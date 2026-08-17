@@ -113,6 +113,11 @@ public class KNNStats {
                 StatNames.MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS.getName(),
                 createNodeStat(new KNNCounterSupplier(KNNCounter.MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS))
             );
+
+        builder.put(
+            StatNames.LATE_INTERACTION_SCORE_REQUESTS.getName(),
+            createNodeStat(new KNNCounterSupplier(KNNCounter.LATE_INTERACTION_SCORE_REQUESTS))
+        );
     }
 
     private void addNativeMemoryStats(ImmutableMap.Builder<String, KNNStat<?>> builder) {
@@ -241,6 +246,14 @@ public class KNNStats {
         clientStatsMap.put(
             KNNRemoteIndexBuildValue.INDEX_BUILD_FAILURE_COUNT.getName(),
             KNNRemoteIndexBuildValue.INDEX_BUILD_FAILURE_COUNT.getValue()
+        );
+        clientStatsMap.put(
+            KNNRemoteIndexBuildValue.INDEX_BUILD_MERGE_ABORT_EXCEPTION.getName(),
+            KNNRemoteIndexBuildValue.INDEX_BUILD_MERGE_ABORT_EXCEPTION.getValue()
+        );
+        clientStatsMap.put(
+            KNNRemoteIndexBuildValue.INDEX_BUILD_TERMINAL_EXCEPTION.getName(),
+            KNNRemoteIndexBuildValue.INDEX_BUILD_TERMINAL_EXCEPTION.getValue()
         );
         clientStatsMap.put(KNNRemoteIndexBuildValue.WAITING_TIME.getName(), KNNRemoteIndexBuildValue.WAITING_TIME.getValue());
 
