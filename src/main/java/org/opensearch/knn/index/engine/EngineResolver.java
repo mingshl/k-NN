@@ -6,17 +6,20 @@
 package org.opensearch.knn.index.engine;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.util.Strings;
 import org.opensearch.Version;
+import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.mapper.Mode;
 
 import java.util.Locale;
 
+import static org.opensearch.knn.common.KNNConstants.FLAT_METHOD_ENGINE_AGNOSTIC_VERSION;
+import static org.opensearch.knn.common.KNNConstants.KNN_DEFAULT_COMPRESSION_FLIP_VERSION;
+import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.METHOD_FLAT;
 import static org.opensearch.knn.index.engine.KNNEngine.DEPRECATED_ENGINES;
 
@@ -25,7 +28,7 @@ import static org.opensearch.knn.index.engine.KNNEngine.DEPRECATED_ENGINES;
  */
 public final class EngineResolver {
 
-    private static Logger logger = LogManager.getLogger(EngineResolver.class);
+    private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(EngineResolver.class);
     public static final EngineResolver INSTANCE = new EngineResolver();
 
     private EngineResolver() {}
@@ -80,6 +83,13 @@ public final class EngineResolver {
         boolean requiresTraining,
         Version version
     ) {
+        // Flat method is engine-agnostic from the user's perspective: it always resolves to
+        // Lucene internally. Reject ANY user-provided engine (method-level or top-level, even if
+        // it happens to be Lucene) — but only for indices created on/after the gate version.
+        // Pre-gate indices may have engine=lucene persisted in their flat mapping and must
+        // continue to load without error.
+        rejectEngineForMethodFlat(knnMethodContext, topLevelEngineString, version);
+
         KNNEngine userConfiguredEngine = resolveAndValidateUserConfiguredEngine(
             knnMethodContext,
             topLevelEngineString,
@@ -104,13 +114,25 @@ public final class EngineResolver {
         Mode mode = knnMethodConfigContext.getMode();
         CompressionLevel compressionLevel = knnMethodConfigContext.getCompressionLevel();
 
-        // If both mode and compression are not specified, we can just default
-        if (Mode.isConfigured(mode) == false && CompressionLevel.isConfigured(compressionLevel) == false) {
+        // Mode deprecation is tied to the default compression flip: log deprecation warning if user explicitly provided mode
+        if (version != null && version.onOrAfter(KNN_DEFAULT_COMPRESSION_FLIP_VERSION) && Mode.isConfigured(mode)) {
+            deprecationLogger.deprecate(
+                "knn_mode_parameter",
+                "The 'mode' parameter is deprecated starting with version {}. Mode is now derived from "
+                    + "'compression_level'. Explicitly setting 'mode' will be removed in a future release.",
+                KNN_DEFAULT_COMPRESSION_FLIP_VERSION
+            );
+        }
+
+        // If compression is not specified, we can default unless mode is configured (legacy path)
+        if (CompressionLevel.isConfigured(compressionLevel) == false && Mode.isConfigured(mode) == false) {
             return KNNEngine.DEFAULT;
         }
 
-        if (compressionLevel == CompressionLevel.x4) {
-            // Lucene is only engine that supports 4x - so we have to default to it here.
+        if (compressionLevel == CompressionLevel.x4 && knnMethodConfigContext.getVectorDataType() != VectorDataType.HALF_FLOAT) {
+            // Lucene is only engine that supports 4x for FLOAT - so we have to default to it here.
+            // For HALF_FLOAT, 4x is SQ 4-bit, which both engines support - fall through to the
+            // generic default below.
             return KNNEngine.LUCENE;
         }
         if (CompressionLevel.isConfigured(compressionLevel) == false || compressionLevel == CompressionLevel.x1) {
@@ -118,6 +140,26 @@ public final class EngineResolver {
             return resolveEngineForX1OrNoCompression(mode, version);
         }
         return KNNEngine.FAISS;
+    }
+
+    private void rejectEngineForMethodFlat(KNNMethodContext knnMethodContext, String topLevelEngineString, Version version) {
+        final boolean isFlatMethod = knnMethodContext != null
+            && METHOD_FLAT.equalsIgnoreCase(knnMethodContext.getMethodComponentContext().getName());
+        if (isFlatMethod == false) {
+            return;
+        }
+        // Skip the reject for pre-gate indices so existing flat mappings with engine=lucene
+        // persisted from earlier versions keep loading.
+        if (version != null && version.before(FLAT_METHOD_ENGINE_AGNOSTIC_VERSION)) {
+            return;
+        }
+        // Flat is engine-agnostic — do not accept any user-provided engine, even if it happens
+        // to match the internally-resolved one.
+        if (hasUserConfiguredMethodEngine(knnMethodContext) || hasUserConfiguredTopLevelEngine(topLevelEngineString)) {
+            throw new MapperParsingException(
+                String.format(Locale.ROOT, "[%s] method does not support [%s] parameter", METHOD_FLAT, KNN_ENGINE)
+            );
+        }
     }
 
     private boolean hasUserConfiguredMethodEngine(KNNMethodContext knnMethodContext) {
@@ -168,7 +210,11 @@ public final class EngineResolver {
 
     private KNNEngine logAndReturnEngine(KNNEngine knnEngine) {
         if (DEPRECATED_ENGINES.contains(knnEngine)) {
-            logger.warn("[Deprecation] {} engine is deprecated and will be removed in a future release.", knnEngine);
+            deprecationLogger.deprecate(
+                "knn_engine_deprecated",
+                "{} engine is deprecated and will be removed in a future release.",
+                knnEngine
+            );
         }
         return knnEngine;
     }
@@ -190,7 +236,9 @@ public final class EngineResolver {
         if (requiresTraining && topLevelEngine != KNNEngine.FAISS) {
             throw new MapperParsingException(String.format(Locale.ROOT, "Cannot specify engine other than FAISS for training"));
         }
-        if (knnMethodConfigContext.getCompressionLevel() == CompressionLevel.x4 && topLevelEngine != KNNEngine.LUCENE) {
+        if (knnMethodConfigContext.getCompressionLevel() == CompressionLevel.x4
+            && topLevelEngine != KNNEngine.LUCENE
+            && knnMethodConfigContext.getVectorDataType() != VectorDataType.HALF_FLOAT) {
             throw new MapperParsingException(String.format(Locale.ROOT, "Lucene is the only engine that supports 4x compression"));
         }
         return topLevelEngine;

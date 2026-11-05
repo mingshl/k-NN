@@ -4,44 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [CONTRIBUTING guide](./CONTRIBUTING.md#Changelog) for instructions on how to add changelog entries.
 
-## [Unreleased 3.8](https://github.com/opensearch-project/k-NN/compare/main...HEAD)
+## [Unreleased 3.10](https://github.com/opensearch-project/k-NN/compare/main...HEAD)
 ### Features
-* Add rescoring phase after radial search on quantized index [#3347](https://github.com/opensearch-project/k-NN/pull/3347)
-* Add base64 encoded vector indexing support for knn_vector fields [#3350](https://github.com/opensearch-project/k-NN/pull/3350)
-* Introduce system-generated search pipeline processor to automatically exclude knn_vector fields from _source in search responses [#3152](https://github.com/opensearch-project/k-NN/pull/3152)
-* Parameterize integration test framework for compression level [#3416](https://github.com/opensearch-project/k-NN/pull/3416)
-* Introduce extensible VectorSearchEngine API [#3288](https://github.com/opensearch-project/k-NN/pull/3443)
-* Enable the approximate graph threshold for Faiss SQ x32 (sq bits=1) indices [#3434](https://github.com/opensearch-project/k-NN/pull/3434)
+* Support knn queries on native engine fields inside percolator queries by scoring the percolated document with exact search [#3556](https://github.com/opensearch-project/k-NN/pull/3556)
+* Add SQ 2-bit and 4-bit for half_float [#3603](https://github.com/opensearch-project/k-NN/pull/3603)
+* Validate the remote index build artifact extension against the destination engine's extension instead of hardcoding Faiss, so non-Faiss engines (e.g. cuVS) are not rejected [#3662](https://github.com/opensearch-project/k-NN/pull/3662)
+* Track late interaction score function usage per query via the k-NN stats API (`late_interaction_score_requests`) [#3509](https://github.com/opensearch-project/k-NN/pull/3509)
 
 ### Maintenance
-* Upgrade Lucene to 10.5.0 [#3411](https://github.com/opensearch-project/k-NN/pull/3411)
-* Re-enable flaky BWC test testKNNWarmupCustomLegacyFieldMapping and restore legacy index settings in BWC test fixtures [#2415](https://github.com/opensearch-project/k-NN/issues/2415)
+* Establish a separate Mend dependency baseline for the 2.19 maintenance branch [#3665](https://github.com/opensearch-project/k-NN/pull/3665).
+* Fixed build issues happening due to Lucene 10.5.2 upgrade [#3631](https://github.com/opensearch-project/k-NN/pull/3631)
+* Use clustered test vectors and the api-snapshot builder image so remote index build ITs pass on cuVS 26.08 [#3627](https://github.com/opensearch-project/k-NN/pull/3627)
 
 ### Bug Fixes
-* Preserve raw non-XContent `_source` fields when derived source is enabled [#3402](https://github.com/opensearch-project/k-NN/pull/3402)
-* Fix dimension-based oversampling not applying for 32x compression [#3455](https://github.com/opensearch-project/k-NN/pull/3455)
-* Fix NPE in nested kNN search when index contains documents without nested object [#3368](https://github.com/opensearch-project/k-NN/pull/3368)
-* Turn off ACORN for MOS to match default Lucene HNSW behavior [#3346](https://github.com/opensearch-project/k-NN/pull/3346)
-* Preserve mixed-case derived source vector field names and add backward-compatible field resolution for previously lowercased segment metadata [#3313](https://github.com/opensearch-project/k-NN/pull/3313)
-* Fix rescore flag not propagating over transport layer in multi-node clusters [#3343](https://github.com/opensearch-project/k-NN/pull/3343)
-* Integrated proper ef_search functionality into MOS and Lucene with oversample_factor [#3331](https://github.com/opensearch-project/k-NN/pull/3331)
-* Fix skip warm up in old indices when MOS is enabled [#3344](https://github.com/opensearch-project/k-NN/pull/3344)
-* Check to see if Lucene's search budget has exhausted when deciding to exact search in MOS [#3354](https://github.com/opensearch-project/k-NN/pull/3354)
-* Fix FAISS SQ merge failure when segment has no live vectors [#3381](https://github.com/opensearch-project/k-NN/pull/3381)
-* Fix FAISS SQ merges when an input segment has no vectors [#3433](https://github.com/opensearch-project/k-NN/pull/3433)
-* Fix isFaissSQfp16 to skip FP16 validation when SQ encoder uses bits=1 [#3366](https://github.com/opensearch-project/k-NN/pull/3366)
-* Fix score corruption in multi-segment FAISS indices with ADC [#3385](https://github.com/opensearch-project/k-NN/pull/3385)
-* Fix corrupt index file when remote build falls back to local build [#3448](https://github.com/opensearch-project/k-NN/pull/3448)
-* Fix radial search max_distance threshold conversion for inner product with memory-optimized search [#3369](https://github.com/opensearch-project/k-NN/pull/3369)
-* Fix inner-hits returning mask value for top level source excludes [#3446](https://github.com/opensearch-project/k-NN/pull/3446)
-* Fix _source bloat on merge for derived source indices with _source.exclude [#3465](https://github.com/opensearch-project/k-NN/pull/3465)
-* Disable radial search on quantized indices due to poor recall from quantization error [#3448](https://github.com/opensearch-project/k-NN/pull/3448)
-* Fix knn query against a field alias returning zero hits silently [#3485](https://github.com/opensearch-project/k-NN/pull/3485)
+* Fix SIGSEGV in Faiss SQ HNSW build caused by 32-bit offset overflow for segments over 2 GiB of quantized vectors [#3653](https://github.com/opensearch-project/k-NN/pull/3653)
+* Align field visibility across k-NN search paths.
+* Rethrow merge abort during native index write so aborted merges no longer fail the shard engine [#3651](https://github.com/opensearch-project/k-NN/pull/3651)
+* Fix `explain` failing with a NullPointerException for Lucene engine queries that use `rescore` or `expand_nested_docs`, and explain those scores as an Exact search [#3641](https://github.com/opensearch-project/k-NN/pull/3641)
+* Fix double free of off-heap vectors when a native index build fails [#3621](https://github.com/opensearch-project/k-NN/pull/3621)
+* Honor query cancellation and timeout in memory-optimized search [#3620](https://github.com/opensearch-project/k-NN/pull/3620)
+* Fix derived source returning another document's nested vectors when a parent has more nested docs than the first child lookup window [#3624](https://github.com/opensearch-project/k-NN/pull/3624)
+* Return model not found instead of the internal model index when getting a model before any model is trained [#3598](https://github.com/opensearch-project/k-NN/pull/3598)
+* Support rescoring with `expand_nested_docs` on the Lucene engine, so the final reduction to k counts parent documents instead of child documents [#3579](https://github.com/opensearch-project/k-NN/pull/3579)
 
 ### Refactoring
-* Refactor ExactSearcher to use BulkVectorScorer directly and rename factory methods [#3361](https://github.com/opensearch-project/k-NN/pull/3361)
+* Make the bulk SIMD kernels format aware: the FP16, BF16 and SQ kernels take the storage format (where a vector's values and correction factors live) as a compile-time parameter instead of hard-coding the Lucene layout, and the Java/JNI similarity function type carries an explicit wire value [#3645](https://github.com/opensearch-project/k-NN/pull/3645)
 
 ### Enhancements
-* Set decay value to experimentally found value 0.95 and use decay method in MOS [#3447](https://github.com/opensearch-project/k-NN/pull/3447)
-* Support `index.knn.advanced.approximate_threshold` for the Lucene engine [#3451](https://github.com/opensearch-project/k-NN/pull/3451)
-* Convert document vectors to primitive arrays once per document in lateInteractionScore, instead of once per query-vector/document-vector pair [#3453](https://github.com/opensearch-project/k-NN/pull/3453)
+* Add AVX-512 kernels for SQ 2-bit and 4-bit distance computation during indexing [#3667](https://github.com/opensearch-project/k-NN/pull/3667)
+* Add SIMD kernels for SQ 2-bit and 4-bit distance computation during indexing [#3655](https://github.com/opensearch-project/k-NN/pull/3655)
+* Score ADC queries from a precomputed per-query table instead of a per-dimension loop [#3633](https://github.com/opensearch-project/k-NN/pull/3633)
+* Use a dedicated 1-bit SQ distance computer to restore 1-bit indexing performance [#3652](https://github.com/opensearch-project/k-NN/pull/3652)
+* Set the CMAKE_BUILD_TYPE to Release to ensure that all targets get build with optimized code [#3622](https://github.com/opensearch-project/k-NN/pull/3622)
+* Avoid FP16 -> FP32 -> FP16 round trip when merging `half_float` segments [#3610](https://github.com/opensearch-project/k-NN/pull/3610)
+* Report `exact_search` timings in the Profile API for nested k-NN queries with `expand_nested_docs` on the Lucene engine [#3579](https://github.com/opensearch-project/k-NN/pull/3579)
+* Remove synchronized keyword from KNNSettings class during Instance creation and made instance creation final [#3630](https://github.com/opensearch-project/k-NN/pull/3630)
+* Send `half_float` vectors to the remote vector index build service as fp16 instead of fp32 [#3608](https://github.com/opensearch-project/k-NN/pull/3608)

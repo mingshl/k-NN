@@ -8,7 +8,10 @@ package org.opensearch.knn.index.query.exactsearch;
 import lombok.SneakyThrows;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.QueryTimeout;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.SegmentReader;
@@ -44,6 +47,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -61,6 +65,37 @@ import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 public class ExactSearcherTests extends KNNTestCase {
 
     private static final String SEGMENT_NAME = "0";
+
+    @SneakyThrows
+    public void testSearchUsesWrappedFieldView() {
+        final SegmentReader segmentReader = mock(SegmentReader.class);
+        final FieldInfos underlyingFieldInfos = mock(FieldInfos.class);
+        when(segmentReader.getFieldInfos()).thenReturn(underlyingFieldInfos);
+        when(underlyingFieldInfos.fieldInfo(FIELD_NAME)).thenReturn(mock(FieldInfo.class));
+        final LeafReader filteredReader = new FilterLeafReader(segmentReader) {
+            @Override
+            public FieldInfos getFieldInfos() {
+                return new FieldInfos(new FieldInfo[0]);
+            }
+
+            @Override
+            public CacheHelper getCoreCacheHelper() {
+                return null;
+            }
+
+            @Override
+            public CacheHelper getReaderCacheHelper() {
+                return null;
+            }
+        };
+        final LeafReaderContext leafReaderContext = mock(LeafReaderContext.class);
+        when(leafReaderContext.reader()).thenReturn(filteredReader);
+        final ExactSearcher.ExactSearcherContext context = ExactSearcher.ExactSearcherContext.builder().field(FIELD_NAME).build();
+
+        final ExactSearcher exactSearcher = new ExactSearcher(null);
+        assertEquals(0, exactSearcher.searchLeaf(leafReaderContext, context).scoreDocs.length);
+        assertNull(exactSearcher.exactSearchScorer(leafReaderContext, context));
+    }
 
     @SneakyThrows
     public void testExactSearch_whenSegmentHasNoVectorField_thenNoDocsReturned() {
@@ -789,5 +824,91 @@ public class ExactSearcherTests extends KNNTestCase {
             }
             assertFalse("doc 1 should be filtered out", matchedDocIds.contains(1));
         }
+    }
+
+    public void testExactSearch_whenTimeoutAlreadyFired_thenNoDocsReturned() {
+        final TopDocs docs = exactSearchWithTimeout(randomVectors(1000), 10, false, () -> true);
+
+        assertEquals(0, docs.scoreDocs.length);
+    }
+
+    public void testExactSearch_whenTimeoutNeverFires_thenTopKReturned() {
+        final TopDocs docs = exactSearchWithTimeout(randomVectors(1000), 10, false, () -> false);
+
+        assertEquals(10, docs.scoreDocs.length);
+    }
+
+    public void testExactSearch_whenTimeoutFiresWhileCollectingTopK_thenStopsScanning() {
+        // Without the timeout the top-k loop visits every batch; most are skipped as non-competitive once the heap
+        // is full, and the check must still run for those.
+        final List<float[]> vectors = randomVectors(5000);
+        final AtomicInteger checksWithoutTimeout = new AtomicInteger();
+        exactSearchWithTimeout(vectors, 10, false, () -> {
+            checksWithoutTimeout.incrementAndGet();
+            return false;
+        });
+        final AtomicInteger checksWithTimeout = new AtomicInteger();
+        exactSearchWithTimeout(vectors, 10, false, () -> checksWithTimeout.incrementAndGet() > 3);
+
+        assertTrue("expected the full scan to span more than 4 batches", checksWithoutTimeout.get() > 4);
+        assertTrue(
+            "the scan must stop soon after the timeout fires, got " + checksWithTimeout.get() + " checks",
+            checksWithTimeout.get() < checksWithoutTimeout.get()
+        );
+    }
+
+    public void testExactSearch_whenTimeoutFiresWhileScoringAllDocs_thenReturnsPartialResults() {
+        final List<float[]> vectors = randomVectors(5000);
+        final AtomicInteger checks = new AtomicInteger();
+        // k >= matched docs routes to scoreAllDocs, which keeps every scored doc.
+        final TopDocs docs = exactSearchWithTimeout(vectors, vectors.size(), true, () -> checks.incrementAndGet() > 1);
+
+        assertTrue("expected at least one batch before the timeout", docs.scoreDocs.length > 0);
+        assertTrue(
+            "expected fewer than all " + vectors.size() + " docs, got " + docs.scoreDocs.length,
+            docs.scoreDocs.length < vectors.size()
+        );
+    }
+
+    @SneakyThrows
+    private TopDocs exactSearchWithTimeout(
+        final List<float[]> vectors,
+        final int k,
+        final boolean withMatchedDocs,
+        final QueryTimeout queryTimeout
+    ) {
+        final float[] queryVector = new float[] { 0.1f, 2.0f, 3.0f };
+        final ExactSearcher.ExactSearcherContext.ExactSearcherContextBuilder contextBuilder = ExactSearcher.ExactSearcherContext.builder()
+            .field(FIELD_NAME)
+            .floatQueryVector(queryVector)
+            .k(k)
+            .queryTimeout(queryTimeout);
+        if (withMatchedDocs) {
+            contextBuilder.matchedDocsIterator(DocIdSetIterator.all(vectors.size())).numberOfMatchedDocs(vectors.size());
+        }
+
+        try (MockedStatic<KNNVectorValuesFactory> vectorValuesFactoryMockedStatic = Mockito.mockStatic(KNNVectorValuesFactory.class)) {
+            final ExactSearcher exactSearcher = new ExactSearcher(null);
+            final LeafReaderContext leafReaderContext = mock(LeafReaderContext.class);
+            final SegmentReader reader = mock(SegmentReader.class);
+            final FieldInfos fieldInfos = mock(FieldInfos.class);
+            final FieldInfo fieldInfo = mock(FieldInfo.class);
+            when(fieldInfo.getAttribute(SPACE_TYPE)).thenReturn(SpaceType.L2.getValue());
+            when(reader.getFieldInfos()).thenReturn(fieldInfos);
+            when(fieldInfos.fieldInfo(FIELD_NAME)).thenReturn(fieldInfo);
+            when(leafReaderContext.reader()).thenReturn(reader);
+            final KNNVectorValues<float[]> vectorValues = TestVectorValues.createKNNFloatVectorValues(vectors);
+            vectorValuesFactoryMockedStatic.when(() -> KNNVectorValuesFactory.getVectorValues(fieldInfo, reader)).thenReturn(vectorValues);
+
+            return exactSearcher.searchLeaf(leafReaderContext, contextBuilder.build());
+        }
+    }
+
+    private static List<float[]> randomVectors(final int count) {
+        final List<float[]> vectors = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            vectors.add(new float[] { randomFloat(), randomFloat(), randomFloat() });
+        }
+        return vectors;
     }
 }

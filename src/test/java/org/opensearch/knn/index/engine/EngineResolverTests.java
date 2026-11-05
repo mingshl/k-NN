@@ -17,6 +17,7 @@ import org.opensearch.knn.index.mapper.Mode;
 import java.io.IOException;
 import java.util.Map;
 
+import static org.opensearch.knn.common.KNNConstants.KNN_DEFAULT_COMPRESSION_FLIP_VERSION;
 import static org.opensearch.knn.common.KNNConstants.NAME;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
 
@@ -121,6 +122,21 @@ public class EngineResolverTests extends KNNTestCase {
         assertEquals(
             KNNEngine.LUCENE,
             ENGINE_RESOLVER.resolveEngine(KNNMethodConfigContext.builder().compressionLevel(CompressionLevel.x4).build(), null, null, false)
+        );
+    }
+
+    public void testResolveEngine_whenCompressionIs4xWithHalfFloat_thenEngineIsFaiss() {
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder()
+                    .vectorDataType(org.opensearch.knn.index.VectorDataType.HALF_FLOAT)
+                    .compressionLevel(CompressionLevel.x4)
+                    .build(),
+                null,
+                null,
+                false
+            )
         );
     }
 
@@ -300,6 +316,70 @@ public class EngineResolverTests extends KNNTestCase {
         );
     }
 
+    public void testResolveEngine_whenFlatMethodWithExplicitLuceneEngine_thenThrow() {
+        // Flat is engine-agnostic — passing engine=lucene explicitly is rejected too.
+        KNNMethodContext flatMethodContext = new KNNMethodContext(
+            KNNEngine.LUCENE,
+            SpaceType.L2,
+            new MethodComponentContext(METHOD_FLAT, Map.of()),
+            true
+        );
+        MapperParsingException ex = expectThrows(
+            MapperParsingException.class,
+            () -> ENGINE_RESOLVER.resolveEngine(KNNMethodConfigContext.builder().build(), flatMethodContext, null, false)
+        );
+        assertTrue(ex.getMessage().contains(METHOD_FLAT));
+        assertTrue(ex.getMessage().toLowerCase(java.util.Locale.ROOT).contains("engine"));
+    }
+
+    public void testResolveEngine_whenFlatMethodWithNonLuceneMethodEngine_thenThrow() {
+        // Flat method + engine=faiss → mapping-time error.
+        KNNMethodContext flatMethodContext = new KNNMethodContext(
+            KNNEngine.FAISS,
+            SpaceType.L2,
+            new MethodComponentContext(METHOD_FLAT, Map.of()),
+            true
+        );
+        MapperParsingException ex = expectThrows(
+            MapperParsingException.class,
+            () -> ENGINE_RESOLVER.resolveEngine(KNNMethodConfigContext.builder().build(), flatMethodContext, null, false)
+        );
+        assertTrue(ex.getMessage().contains(METHOD_FLAT));
+        assertTrue(ex.getMessage().toLowerCase(java.util.Locale.ROOT).contains("engine"));
+    }
+
+    public void testResolveEngine_whenFlatMethodWithTopLevelEngine_thenThrow() {
+        // Flat method + any top-level engine (Lucene or not) → mapping-time error.
+        KNNMethodContext flatMethodContext = new KNNMethodContext(
+            KNNEngine.UNDEFINED,
+            SpaceType.L2,
+            new MethodComponentContext(METHOD_FLAT, Map.of()),
+            false
+        );
+        for (KNNEngine topLevel : new KNNEngine[] { KNNEngine.LUCENE, KNNEngine.FAISS }) {
+            MapperParsingException ex = expectThrows(
+                MapperParsingException.class,
+                () -> ENGINE_RESOLVER.resolveEngine(KNNMethodConfigContext.builder().build(), flatMethodContext, topLevel.getName(), false)
+            );
+            assertTrue("topLevel=" + topLevel, ex.getMessage().contains(METHOD_FLAT));
+            assertTrue("topLevel=" + topLevel, ex.getMessage().toLowerCase(java.util.Locale.ROOT).contains("engine"));
+        }
+    }
+
+    public void testResolveEngine_whenFlatMethodWithPreGateVersion_thenLucene() {
+        // Pre-gate flat mappings that had engine=lucene persisted must still resolve without throwing.
+        KNNMethodContext flatMethodContext = new KNNMethodContext(
+            KNNEngine.LUCENE,
+            SpaceType.L2,
+            new MethodComponentContext(METHOD_FLAT, Map.of()),
+            true
+        );
+        assertEquals(
+            KNNEngine.LUCENE,
+            ENGINE_RESOLVER.resolveEngine(KNNMethodConfigContext.builder().build(), flatMethodContext, null, false, Version.V_3_7_0)
+        );
+    }
+
     public void testResolveEngine_whenOnDiskWith32xCompression_thenFaiss() {
         assertEquals(
             KNNEngine.FAISS,
@@ -320,6 +400,86 @@ public class EngineResolverTests extends KNNTestCase {
                 null,
                 null,
                 false
+            )
+        );
+    }
+
+    public void testResolveEngine_whenModeProvidedOnV380_thenStillResolvesCorrectly() {
+        // On KNN_DEFAULT_COMPRESSION_FLIP_VERSION (V_3_8_0)+ mode is deprecated but still honored — verify correct resolution
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x32).build(),
+                null,
+                null,
+                false,
+                KNN_DEFAULT_COMPRESSION_FLIP_VERSION
+            )
+        );
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().mode(Mode.IN_MEMORY).compressionLevel(CompressionLevel.x1).build(),
+                null,
+                null,
+                false,
+                KNN_DEFAULT_COMPRESSION_FLIP_VERSION
+            )
+        );
+    }
+
+    public void testResolveEngine_whenModeProvidedWithNullVersion_thenNoDeprecationAndResolves() {
+        // Null version skips the deprecation check and falls through to legacy resolution
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x32).build(),
+                null,
+                null,
+                false,
+                null
+            )
+        );
+    }
+
+    public void testResolveEngine_whenModeProvidedBeforeFlipVersion_thenNoDeprecationAndResolves() {
+        // Versions before KNN_DEFAULT_COMPRESSION_FLIP_VERSION do not log deprecation for mode
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x32).build(),
+                null,
+                null,
+                false,
+                Version.V_3_6_0
+            )
+        );
+    }
+
+    public void testResolveEngine_whenDeprecatedEngineResolved_thenStillReturnsEngine() {
+        // NMSLIB is deprecated; logAndReturnEngine should log via deprecation logger and return it unchanged
+        assertEquals(
+            KNNEngine.NMSLIB,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().build(),
+                new KNNMethodContext(KNNEngine.NMSLIB, SpaceType.DEFAULT, MethodComponentContext.EMPTY),
+                null,
+                false,
+                Version.V_2_18_0
+            )
+        );
+    }
+
+    public void testResolveEngine_whenOnlyModeProvidedOnV380_thenResolvesLegacyPath() {
+        // Mode-only (no compression) still resolves via legacy path
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().mode(Mode.ON_DISK).build(),
+                null,
+                null,
+                false,
+                KNN_DEFAULT_COMPRESSION_FLIP_VERSION
             )
         );
     }
@@ -350,9 +510,25 @@ public class EngineResolverTests extends KNNTestCase {
         );
     }
 
+    public void testValidateTopLevelEngine_whenHalfFloatWith4xCompression_thenFaissAllowed() {
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder()
+                    .vectorDataType(org.opensearch.knn.index.VectorDataType.HALF_FLOAT)
+                    .compressionLevel(CompressionLevel.x4)
+                    .build(),
+                null,
+                "faiss",
+                false,
+                Version.CURRENT
+            )
+        );
+    }
+
     public void testResolveEngine_whenNoModeNoCompressionAcrossVersions_thenDefault() {
-        // TODO: [DEFAULT_FLIP] After Step 4, split into: indexVersionCreated < V_3_7_0 → assert DEFAULT,
-        // indexVersionCreated >= V_3_7_0 → assert x32 default triggers engine resolution
+        // TODO: [DEFAULT_FLIP] After Step 4, split into: indexVersionCreated < KNN_DEFAULT_COMPRESSION_FLIP_VERSION → assert DEFAULT,
+        // indexVersionCreated >= KNN_DEFAULT_COMPRESSION_FLIP_VERSION → assert x32 default triggers engine resolution
         Version[] versions = new Version[] { Version.V_2_18_0, Version.V_3_0_0, Version.V_3_5_0, Version.V_3_6_0, Version.CURRENT };
 
         for (Version version : versions) {

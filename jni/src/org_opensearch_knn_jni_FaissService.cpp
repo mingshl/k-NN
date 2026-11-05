@@ -577,11 +577,11 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_setMergeInterrup
 }
 
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_initFaissSQIndex(
-    JNIEnv * env, jclass cls, jint totalLiveDocs, jint dimJ, jobject parametersJ, jfloat centroidDp, jint quantizedVecBytes) {
+    JNIEnv * env, jclass cls, jint totalLiveDocs, jint dimJ, jobject parametersJ, jfloat centroidDp, jint quantizedVecBytes, jint docBits) {
     try {
         std::unique_ptr<knn_jni::faiss_wrapper::FaissMethods> faissMethods(new knn_jni::faiss_wrapper::FaissMethods());
         knn_jni::faiss_wrapper::BinaryIndexService binaryIndexService(std::move(faissMethods));
-        return knn_jni::faiss_wrapper::InitFaissSQIndex(&jniUtil, env, totalLiveDocs, dimJ, parametersJ, &binaryIndexService, centroidDp, quantizedVecBytes);
+        return knn_jni::faiss_wrapper::InitFaissSQIndex(&jniUtil, env, totalLiveDocs, dimJ, parametersJ, &binaryIndexService, centroidDp, quantizedVecBytes, docBits);
     } catch (...) {
         jniUtil.CatchCppExceptionAndThrowJava(env);
     }
@@ -609,8 +609,7 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_addDocsToSQIndex
 
         // Get the next batch of vectors to be added to HNSW
         // Note that we've already inserted quantized vectors in storage, just that it's not visible yet.
-        auto* vecPtr = faissSQFlat->quantizedVectorsAndCorrectionFactors.data()
-                       + (numAdded * faissSQFlat->oneElementSize);
+        const uint8_t* vecPtr = faissSQFlat->elementsAt(numAdded, numDocs);
 
         // Keep building HNSW
         binaryIdMap->add_with_ids(numDocs, vecPtr, &docIds[0]);

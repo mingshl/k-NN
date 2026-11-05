@@ -129,18 +129,11 @@ public class Faiss extends NativeLibrary {
         return methodResolver.resolveMethod(knnMethodContext, knnMethodConfigContext, shouldRequireTraining, spaceType);
     }
 
-    /**
-     * Use the method name to route the check to the specific method class
-     */
     @Override
     public boolean supportsRemoteIndexBuild(KNNLibraryIndexingContext knnLibraryIndexingContext) {
-        if (knnLibraryIndexingContext != null) {
-            Map<String, Object> parameters = knnLibraryIndexingContext.getLibraryParameters();
-            if (METHOD_HNSW.equals(parameters.get(NAME))) {
-                return FaissHNSWMethod.supportsRemoteIndexBuild(parameters);
-            }
-        }
-        return false;
+        // The context itself can still be null: KNNMappingConfig.getKnnLibraryIndexingContext() defaults
+        // to null for model fields. Contexts produced by AbstractKNNMethod always carry a non-null spec.
+        return knnLibraryIndexingContext != null && knnLibraryIndexingContext.getResolvedSpec().supportsRemoteIndexBuild();
     }
 
     @Override
@@ -155,6 +148,31 @@ public class Faiss extends NativeLibrary {
     @Override
     public VectorSearcherFactory getVectorSearcherFactory() {
         return new FaissMemoryOptimizedSearcherFactory();
+    }
+
+    @Override
+    public boolean supportsIterativeBuild() {
+        return true;
+    }
+
+    @Override
+    public boolean createsCustomSegmentFiles() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsFilters() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsRadialSearch() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsNestedFields() {
+        return true;
     }
 
     @Override

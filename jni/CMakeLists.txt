@@ -7,6 +7,16 @@ cmake_minimum_required(VERSION 3.24.0)
 
 project(KNNPlugin_JNI)
 
+# Default to an optimized Release build (-O3 -DNDEBUG) for every target. Previously the build type was only set
+# as a side effect of including NMSLIB's CMakeLists, so FAISS-only builds compiled the JNI libraries without
+# optimization. An explicit -DCMAKE_BUILD_TYPE (e.g. Debug) still takes precedence. Multi-config generators
+# (Xcode, Visual Studio) pick the configuration at build time and ignore CMAKE_BUILD_TYPE.
+get_property(KNN_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if (NOT KNN_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build types: Release Debug RelWithDebInfo MinSizeRel" FORCE)
+endif ()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/macros.cmake)
 
 # ---------------------------------- SETUP ----------------------------------
@@ -24,6 +34,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 option(CONFIG_FAISS "Configure faiss library build when this is on")
 option(CONFIG_NMSLIB "Configure nmslib library build when this is on")
 option(CONFIG_TEST "Configure tests when this is on")
+# CONFIG_SANDBOX is deliberately NOT part of the CONFIG_ALL auto-on logic below: sandbox tenants are built
+# only when Gradle passes -DCONFIG_SANDBOX=ON (-Pknn.sandbox.enabled=true). See jni/sandbox/ and sandbox/README.md.
+option(CONFIG_SANDBOX "Configure experimental sandbox tenant JNI libraries when this is on" OFF)
 
 if (${CONFIG_FAISS} STREQUAL OFF AND ${CONFIG_NMSLIB} STREQUAL OFF AND ${CONFIG_TEST} STREQUAL OFF)
     set(CONFIG_ALL ON)
@@ -128,6 +141,13 @@ endif ()
 
 # ---------------------------------------------------------------------------
 
+# ------------- Sandbox tenants (experimental, opt-in): see jni/sandbox/ -------------
+if (${CONFIG_SANDBOX} STREQUAL ON)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/sandbox/tenants.cmake)
+endif ()
+
+# ---------------------------------------------------------------------------
+
 # ----------------------------- SIMD Computing ------------------------------
 # Init SIMD computing properties
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/init-simd.cmake)
@@ -135,7 +155,9 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/init-simd.cmake)
 # Set target library + source
 set(SIMD_COMPUTING_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_SimdVectorComputeService.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_SimdFp16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/simd/similarity_function/similarity_function.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/simd/fp16_codec/fp16_codec.cpp
 )
 
 # Make it a shared library
@@ -158,11 +180,6 @@ target_include_directories(${TARGET_LIB_SIMD} PRIVATE
 
 # Set common properties
 opensearch_set_common_properties(${TARGET_LIB_SIMD})
-
-# Set the output name to embed the SIMD extension (if any)
-set_target_properties(${TARGET_LIB_SIMD} PROPERTIES
-    OUTPUT_NAME "${TARGET_LIB_SIMD}"
-)
 
 # Add target SIMD library to TARGET_LIBS list
 list(APPEND TARGET_LIBS ${TARGET_LIB_SIMD})
@@ -202,6 +219,7 @@ if ("${WIN32}" STREQUAL "")
                 tests/nmslib_stream_support_test.cpp
                 tests/faiss_index_bq_unit_test.cpp
                 tests/faiss_sq_distance_computer_test.cpp
+                tests/build_config_test.cpp
         )
 
         target_link_libraries(
@@ -216,6 +234,8 @@ if ("${WIN32}" STREQUAL "")
                 ${TARGET_LIB_COMMON}
                 ${TARGET_LIB_UTIL}
         )
+
+        target_compile_definitions(jni_test PRIVATE ${KNN_BUILD_CONFIG_DEFINITIONS})
 
         target_include_directories(jni_test PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests

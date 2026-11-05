@@ -23,6 +23,7 @@ if(NOT DEFINED AVX512_SPR_ENABLED)
     if(AVX512_ENABLED AND ${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
         find_program(LSCPU_PROGRAM lscpu)
         if(LSCPU_PROGRAM)
+            execute_process(COMMAND ${LSCPU_PROGRAM} OUTPUT_VARIABLE CPU_INFO)
             if(CPU_INFO MATCHES "GenuineIntel" AND
                CPU_INFO MATCHES "avx512_fp16" AND
                CPU_INFO MATCHES "avx512_bf16" AND
@@ -73,14 +74,20 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND AVX512_SPR_ENABLED)
     # -mavx512bw : 16-bit Masking. Ex: __mmask16, mask generation
     # -mavx512vl : 256-bit "Sub-vector" support. Ex: _mm256_maskz_loadu_epi16
     # -mavx512fp16 : Native FP16 / EVEX Conversion.
-    set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512fp16")
+    # -mavx512bf16 : Native BF16 dot-product (_mm512_dpbf16_ps) and FP32->BF16 conversion.
+    # -mprefer-vector-width=512 : Emit 512-bit (zmm) code instead of the 256-bit default.
+    set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512fp16 -mavx512bf16 -mprefer-vector-width=512")
     check_cxx_source_compiles("
         #include <immintrin.h>
         int main() {
             __m512 v = _mm512_set1_ps(1.0f);
             __m256i h = _mm512_cvt_roundps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             __m512 w = _mm512_cvtph_ps(h);
+            // Verify AVX512-BF16 support, since the SPR kernels use it for BF16 IP.
+            __m512bh bf = (__m512bh)_mm512_cvtne2ps_pbh(v, v);
+            __m512 acc = _mm512_dpbf16_ps(_mm512_setzero_ps(), bf, bf);
             (void)w;
+            (void)acc;
             return 0;
         }" HAVE_AVX512_SPR_COMPILER)
     unset(CMAKE_REQUIRED_FLAGS)
@@ -88,7 +95,7 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND AVX512_SPR_ENABLED)
     if(HAVE_AVX512_SPR_COMPILER)
         set(KNN_HAVE_AVX512_SPR ON)
         set(SIMD_OPT_LEVEL "avx512_spr")
-        set(SIMD_FLAGS -mavx512f -mavx512bw -mavx512vl -mavx512fp16)
+        set(SIMD_FLAGS -mavx512f -mavx512bw -mavx512vl -mavx512fp16 -mf16c -mavx512bf16 -mprefer-vector-width=512)
         add_definitions(-DKNN_HAVE_AVX512_SPR)
         message(STATUS "[SIMD] AVX512_SPR supported by compiler.")
     else()
@@ -99,7 +106,7 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND AVX512_ENABLED)
     # -mavx512f	: 512-bit Registers & FMA. Ex: __m512, _mm512_fmadd_ps
     # -mavx512bw : 16-bit Masking. Ex: __mmask16, mask generation
     # -mavx512vl : 256-bit "Sub-vector" support. Ex: _mm256_maskz_loadu_epi16
-    set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512vl -mavx512bw")
+    set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512vl -mavx512bw -mf16c")
     check_cxx_source_compiles("
         #include <immintrin.h>
         int main() {
@@ -113,7 +120,7 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND AVX512_ENABLED)
     if(HAVE_AVX512_COMPILER)
         set(KNN_HAVE_AVX512 ON)
         set(SIMD_OPT_LEVEL "avx512") # Keep optimization level as avx512 to improve performance on Linux. This is not present on mac systems, and presently not supported on Windows OS.
-        set(SIMD_FLAGS -mavx512f -mavx512vl -mavx512bw)
+        set(SIMD_FLAGS -mavx512f -mavx512vl -mavx512bw -mf16c)
         add_definitions(-DKNN_HAVE_AVX512)
         message(STATUS "[SIMD] AVX512 + F16C supported by compiler.")
     else()

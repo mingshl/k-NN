@@ -10,10 +10,14 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
+import org.opensearch.knn.index.engine.Encoder;
+import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.MethodComponentContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 
 import java.util.Map;
 
@@ -97,7 +101,7 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
         );
     }
 
-    public void testResolve_whenCalledWithFieldContext_andSQOneBitEncoder_thenReturnsSQOneBitFormat() {
+    public void testResolve_whenCalledWithFieldContext_andSQOneBitSpec_thenReturnsSQOneBitFormat() {
         MapperService mapperService = mock(MapperService.class);
         IndexSettings indexSettings = mock(IndexSettings.class);
         when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
@@ -105,17 +109,28 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
 
         FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
 
-        MethodComponentContext encoderContext = new MethodComponentContext(ENCODER_SQ, Map.of(SQ_BITS, 1));
-        Map<String, Object> params = Map.of(METHOD_ENCODER_PARAMETER, encoderContext);
+        ResolvedIndexSpec sqOneBitSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .build();
 
-        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, params, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            sqOneBitSpec,
+            VectorDataType.FLOAT
+        );
         assertTrue(
-            "Expected Faiss104ScalarQuantizedKnnVectorsFormat but got " + result.getClass().getSimpleName(),
+            "Expected Faiss1040ScalarQuantizedKnnVectorsFormat but got " + result.getClass().getSimpleName(),
             result instanceof Faiss1040ScalarQuantizedKnnVectorsFormat
         );
     }
 
-    public void testResolve_whenCalledWithFieldContext_andNoEncoder_thenReturnsNativeFormat() {
+    public void testResolve_whenCalledWithFieldContext_andNonSQOneBitSpec_thenReturnsNativeFormat() {
         MapperService mapperService = mock(MapperService.class);
         IndexSettings indexSettings = mock(IndexSettings.class);
         when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
@@ -123,14 +138,26 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
 
         FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
 
-        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, Map.of(), DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        ResolvedIndexSpec flatSpec = ResolvedIndexSpec.builder().engine(KNNEngine.FAISS).encoderType(Encoder.EncoderType.FLAT).build();
+
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            flatSpec,
+            VectorDataType.FLOAT
+        );
         assertTrue(
             "Expected NativeEngines990KnnVectorsFormat but got " + result.getClass().getSimpleName(),
             result instanceof NativeEngines990KnnVectorsFormat
         );
     }
 
-    public void testResolve_whenCalledWithFieldContext_andNonSQOneBitEncoder_thenReturnsNativeFormat() {
+    public void testResolve_whenCalledWithFieldContext_andSQSixteenBitSpec_thenReturnsNativeFormat() {
+        // SQ bits=16 (fp16) does NOT go through the multi-bit MOS path — falls through to the
+        // default native format. Only bits ∈ {1, 2, 4} route to Faiss1040ScalarQuantizedKnnVectorsFormat.
         MapperService mapperService = mock(MapperService.class);
         IndexSettings indexSettings = mock(IndexSettings.class);
         when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
@@ -138,10 +165,21 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
 
         FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
 
-        MethodComponentContext encoderContext = new MethodComponentContext("sq", Map.of());
-        Map<String, Object> params = Map.of(METHOD_ENCODER_PARAMETER, encoderContext);
+        ResolvedIndexSpec sqSixteenBitSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+            .build();
 
-        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, params, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            sqSixteenBitSpec,
+            VectorDataType.FLOAT
+        );
         assertTrue(
             "Expected NativeEngines990KnnVectorsFormat but got " + result.getClass().getSimpleName(),
             result instanceof NativeEngines990KnnVectorsFormat
@@ -155,8 +193,17 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
         when(mapperService.getIndexSettings()).thenReturn(indexSettings);
 
         FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
-        // Null params should fall back to default native format
-        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, null, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        // A non-SQ-1-bit spec should fall back to the default native format
+        ResolvedIndexSpec flatSpec = ResolvedIndexSpec.builder().engine(KNNEngine.FAISS).encoderType(Encoder.EncoderType.FLAT).build();
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            null,
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            flatSpec,
+            VectorDataType.FLOAT
+        );
         assertTrue(
             "Expected NativeEngines990KnnVectorsFormat but got " + result.getClass().getSimpleName(),
             result instanceof NativeEngines990KnnVectorsFormat
@@ -174,10 +221,107 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
         MethodComponentContext encoderContext = new MethodComponentContext(ENCODER_SQ, Map.of(SQ_BITS, 16));
         Map<String, Object> params = Map.of(METHOD_ENCODER_PARAMETER, encoderContext);
 
-        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, params, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        ResolvedIndexSpec sqSixteenBitSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+            .build();
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            params,
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            sqSixteenBitSpec,
+            VectorDataType.FLOAT
+        );
         assertTrue(
             "SQ with bits=16 should return NativeEngines990KnnVectorsFormat, got " + result.getClass().getSimpleName(),
             result instanceof NativeEngines990KnnVectorsFormat
+        );
+    }
+
+    public void testResolve_whenFlatEncoderAndHalfFloat_thenUsesFp16VecDelegate() {
+        MapperService mapperService = mock(MapperService.class);
+        IndexSettings indexSettings = mock(IndexSettings.class);
+        when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
+        when(mapperService.getIndexSettings()).thenReturn(indexSettings);
+
+        FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
+        ResolvedIndexSpec flatHalfFloatSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.FLAT)
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .build();
+
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            flatHalfFloatSpec,
+            VectorDataType.HALF_FLOAT
+        );
+        assertTrue(result.toString().contains("KNN1040HalfFloatFlatVectorsFormat"));
+    }
+
+    public void testResolve_whenSqSixteenBitFloat_thenKeepsFloatFormat_noFp16Dedup() {
+        MapperService mapperService = mock(MapperService.class);
+        IndexSettings indexSettings = mock(IndexSettings.class);
+        when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
+        when(mapperService.getIndexSettings()).thenReturn(indexSettings);
+
+        FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
+        // FLOAT + sq,16 must stay on the plain FLOAT format. The fp16 dedup for this case exists on the
+        // fp16-for-faiss branch but is deliberately out of scope here: only half_float fields get the
+        // FP16 .vec delegate, so no FLOAT configuration changes storage layout.
+        ResolvedIndexSpec sqSixteenFloatSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+            .vectorDataType(VectorDataType.FLOAT)
+            .build();
+
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            sqSixteenFloatSpec,
+            VectorDataType.FLOAT
+        );
+        assertFalse(result.toString().contains("KNN1040HalfFloatFlatVectorsFormat"));
+        assertTrue(result.toString().contains("Lucene99FlatVectorsFormat"));
+    }
+
+    public void testResolve_whenCalledWithFieldContext_andSQOneBitSpec_andHalfFloat_thenReturnsSQOneBitFormat() {
+        MapperService mapperService = mock(MapperService.class);
+        IndexSettings indexSettings = mock(IndexSettings.class);
+        when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
+        when(mapperService.getIndexSettings()).thenReturn(indexSettings);
+
+        FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(mapperService, mock(NativeIndexBuildStrategyFactory.class));
+        ResolvedIndexSpec sqOneBitHalfFloatSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .build();
+
+        KnnVectorsFormat result = resolver.resolve(
+            TEST_FIELD,
+            null,
+            Map.of(),
+            DEFAULT_MAX_CONN,
+            DEFAULT_BEAM_WIDTH,
+            sqOneBitHalfFloatSpec,
+            VectorDataType.HALF_FLOAT
+        );
+        assertTrue(
+            "Expected Faiss1040ScalarQuantizedKnnVectorsFormat but got " + result.getClass().getSimpleName(),
+            result instanceof Faiss1040ScalarQuantizedKnnVectorsFormat
         );
     }
 }

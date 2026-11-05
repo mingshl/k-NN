@@ -52,6 +52,7 @@ import org.opensearch.knn.plugin.transport.UpdateModelGraveyardRequest;
 import org.opensearch.knn.training.TrainingJobClusterStateListener;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.Collections;
@@ -130,7 +131,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
 
         // insert model
         String modelId = "created-1";
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
 
         Model model = new Model(
@@ -186,7 +187,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
 
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
         String modelId = "efbsdhcvbsd"; // User provided model id
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
 
         Model model = new Model(
@@ -358,7 +359,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
 
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
         String modelId = "efbsdhcvbsd"; // User provided model id
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
 
         Model model = new Model(
@@ -445,10 +446,29 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
         assertTrue(inProgressLatch2.await(100, TimeUnit.SECONDS));
     }
 
+    public void testGet_whenModelIndexDoesNotExist_thenResourceNotFound() throws InterruptedException {
+        ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
+
+        final CountDownLatch inProgressLatch = new CountDownLatch(1);
+        ActionListener<GetModelResponse> listener = ActionListener.wrap(
+            response -> fail("Getting a model when the model index does not exist should throw ResourceNotFoundException"),
+            exception -> {
+                // IndexNotFoundException extends ResourceNotFoundException, so instanceof would also hold
+                // for the unguarded path that lets the missing index escape. Pin the exact type.
+                assertEquals(ResourceNotFoundException.class, exception.getClass());
+                assertTrue(exception.getMessage(), exception.getMessage().contains("Model [any-model-id] does not exist"));
+                inProgressLatch.countDown();
+            }
+        );
+
+        modelDao.get("any-model-id", listener);
+        assertTrue(inProgressLatch.await(100, TimeUnit.SECONDS));
+    }
+
     public void testGet() throws IOException, InterruptedException, ExecutionException {
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
         String modelId = "efbsdhcvbsd";
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
 
         // model index doesnt exist
@@ -519,7 +539,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
         assertNull(modelDao.getMetadata(modelId));
 
         // Model exists
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
 
         KNNEngine knnEngine = KNNEngine.FAISS;
         SpaceType spaceType = SpaceType.INNER_PRODUCT;
@@ -562,7 +582,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
         String modelId = "testDeleteModelID";
         String modelId1 = "testDeleteModelID1";
-        byte[] modelBlob = "hello".getBytes();
+        byte[] modelBlob = "hello".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
 
         final CountDownLatch inProgressLatch = new CountDownLatch(1);
@@ -710,7 +730,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
     public void testDeleteModelInTrainingWithStepListeners() throws IOException, ExecutionException, InterruptedException {
         String modelId = "test-model-id-training";
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
-        byte[] modelBlob = "deleteModel".getBytes();
+        byte[] modelBlob = "deleteModel".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
         createIndex(MODEL_INDEX_NAME);
 
@@ -756,7 +776,7 @@ public class ModelDaoTests extends KNNSingleNodeTestCase {
     public void testDeleteWithStepListeners() throws IOException, InterruptedException, ExecutionException {
         String modelId = "test-model-id-delete";
         ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
-        byte[] modelBlob = "deleteModel".getBytes();
+        byte[] modelBlob = "deleteModel".getBytes(StandardCharsets.UTF_8);
         int dimension = 2;
         createIndex(MODEL_INDEX_NAME);
 

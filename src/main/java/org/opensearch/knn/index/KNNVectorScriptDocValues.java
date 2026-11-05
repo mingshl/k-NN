@@ -5,6 +5,8 @@
 
 package org.opensearch.knn.index;
 
+import java.util.Locale;
+
 import java.io.IOException;
 import java.util.Objects;
 import lombok.AccessLevel;
@@ -44,6 +46,7 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
     public T getValue() {
         if (!docExists) {
             String errorMessage = String.format(
+                Locale.ROOT,
                 "One of the document doesn't have a value for field '%s'. "
                     + "This can be avoided by checking if a document has a value for the field or not "
                     + "by doc['%s'].size() == 0 ? 0 : {your script}",
@@ -173,7 +176,7 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
      * @return An empty KNNVectorScriptDocValues object.
      */
     public static KNNVectorScriptDocValues<?> emptyValues(String fieldName, VectorDataType type) {
-        if (type == VectorDataType.FLOAT) {
+        if (type == VectorDataType.FLOAT || type == VectorDataType.HALF_FLOAT) {
             return new KNNVectorScriptDocValues<float[]>(DocIdSetIterator.empty(), fieldName, type) {
                 @Override
                 protected float[] doGetValue() throws IOException {

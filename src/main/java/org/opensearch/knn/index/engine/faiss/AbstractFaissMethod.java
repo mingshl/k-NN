@@ -20,6 +20,7 @@ import java.util.Set;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SIGNED_BYTE_SQ;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.index.engine.faiss.Faiss.FAISS_BINARY_INDEX_DESCRIPTION_PREFIX;
+import static org.opensearch.knn.index.engine.faiss.FaissBF16Util.isFaissSQbf16;
 import static org.opensearch.knn.index.engine.faiss.FaissFP16Util.isFaissSQClipToFP16RangeEnabled;
 import static org.opensearch.knn.index.engine.faiss.FaissFP16Util.isFaissSQfp16;
 
@@ -54,7 +55,14 @@ public abstract class AbstractFaissMethod extends AbstractKNNMethod {
             if (isFaissSQfp16(knnMethodContext.getMethodComponentContext())) {
                 return FaissFP16Util.FP16_VALIDATOR;
             }
+            if (isFaissSQbf16(knnMethodContext.getMethodComponentContext())) {
+                return FaissBF16Util.BF16_VALIDATOR;
+            }
             return PerDimensionValidator.DEFAULT_FLOAT_VALIDATOR;
+        }
+
+        if (VectorDataType.HALF_FLOAT == vectorDataType) {
+            return PerDimensionValidator.DEFAULT_HALF_FLOAT_VALIDATOR;
         }
 
         throw new IllegalStateException("Unsupported vector data type " + vectorDataType);
@@ -79,6 +87,10 @@ public abstract class AbstractFaissMethod extends AbstractKNNMethod {
             if (isFaissSQClipToFP16RangeEnabled(knnMethodContext.getMethodComponentContext())) {
                 return FaissFP16Util.CLIP_TO_FP16_PROCESSOR;
             }
+            return PerDimensionProcessor.NOOP_PROCESSOR;
+        }
+
+        if (VectorDataType.HALF_FLOAT == vectorDataType) {
             return PerDimensionProcessor.NOOP_PROCESSOR;
         }
 
@@ -168,7 +180,7 @@ public abstract class AbstractFaissMethod extends AbstractKNNMethod {
     }
 
     @Override
-    protected VectorTransformer getVectorTransformer(SpaceType spaceType) {
-        return VectorTransformerFactory.getVectorTransformer(KNNEngine.FAISS, spaceType, null);
+    protected VectorTransformer getVectorTransformer(SpaceType spaceType, VectorDataType vectorDataType) {
+        return VectorTransformerFactory.getVectorTransformer(KNNEngine.FAISS, spaceType, null, vectorDataType);
     }
 }

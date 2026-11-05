@@ -89,7 +89,7 @@ public class RescoreKnnVectorQueryTests extends OpenSearchTestCase {
                 Query innerQuery = new MatchAllDocsQuery();
                 try (MockedStatic<ModelDao.OpenSearchKNNModelDao> mocked = Mockito.mockStatic(ModelDao.OpenSearchKNNModelDao.class)) {
                     mocked.when(ModelDao.OpenSearchKNNModelDao::getInstance).thenReturn(mock(ModelDao.OpenSearchKNNModelDao.class));
-                    IndexSearcher searcher = newSearcher(reader, true, false);
+                    IndexSearcher searcher = new IndexSearcher(reader);
                     RescoreKNNVectorQuery rescoreKnnVectorQuery = new RescoreKNNVectorQuery(innerQuery, FIELD_NAME, finalK, queryVector, 1);
                     TopDocs rescoredDocs = searcher.search(rescoreKnnVectorQuery, finalK);
                     assertEquals(finalK, rescoredDocs.scoreDocs.length);
@@ -141,7 +141,12 @@ public class RescoreKnnVectorQueryTests extends OpenSearchTestCase {
             verify(searcher).rewrite(mockedInnerQuery);
             verify(searcher).createWeight(mockedRewrittenQuery, ScoreMode.TOP_SCORES, 1);
             verify(mockedExactSearcher).searchLeaf(any(), any());
-            Query expectedQuery = QueryUtils.getInstance().createDocAndScoreQuery(searcher.getIndexReader(), exactSearchResults);
+            Query expectedQuery = QueryUtils.getInstance()
+                .createDocAndScoreQuery(
+                    searcher.getIndexReader(),
+                    exactSearchResults,
+                    (QueryUtils.ScoreExplainer) (context, doc, score) -> null
+                );
             assertEquals(expectedQuery, queryWeight.getQuery());
         }
 

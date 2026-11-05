@@ -5,6 +5,9 @@
 
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
+import java.util.Locale;
+
+import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
@@ -14,6 +17,7 @@ import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsWriter;
 import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
@@ -25,25 +29,35 @@ import java.io.IOException;
  */
 public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantizedVectorsFormat {
 
+    private static final String FORMAT_NAME = "KNN1040ScalarQuantizedVectorsFormat";
+
     private static final KNN1040ScalarQuantizedVectorScorer KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER = FlatVectorsScorerProvider
         .getKNN1040ScalarQuantizedVectorScorer(FlatVectorsScorerProvider.getLucene99FlatVectorsScorer());
 
     // Must use the default Lucene scorer here, not KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER.
     // KNN1040ScalarQuantizedVectorScorer.getRandomVectorScorer(float[]) always assumes quantized
     // vectors and will fail (NPE/exception) when called with raw OffHeapFloatVectorValues.
-    private static final Lucene99FlatVectorsFormat RAW_VECTOR_FORMAT = new Lucene99FlatVectorsFormat(
+    private static final Lucene99FlatVectorsFormat RAW_VECTOR_FORMAT_FLOAT = new Lucene99FlatVectorsFormat(
         FlatVectorsScorerProvider.getLucene99FlatVectorsScorer()
     );
 
+    private static final KNN1040HalfFloatFlatVectorsFormat RAW_VECTOR_FORMAT_HALF_FLOAT = new KNN1040HalfFloatFlatVectorsFormat();
+
     private final ScalarEncoding encoding;
+    private final FlatVectorsFormat rawVectorFormat;
 
     public KNN1040ScalarQuantizedVectorsFormat() {
         this(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
     }
 
     public KNN1040ScalarQuantizedVectorsFormat(final ScalarEncoding encoding) {
+        this(encoding, VectorDataType.FLOAT);
+    }
+
+    KNN1040ScalarQuantizedVectorsFormat(final ScalarEncoding encoding, final VectorDataType rawVectorDataType) {
         super(encoding);
         this.encoding = encoding;
+        this.rawVectorFormat = VectorDataType.HALF_FLOAT == rawVectorDataType ? RAW_VECTOR_FORMAT_HALF_FLOAT : RAW_VECTOR_FORMAT_FLOAT;
     }
 
     @Override
@@ -51,7 +65,7 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
         return new Lucene104ScalarQuantizedVectorsWriter(
             state,
             encoding,
-            RAW_VECTOR_FORMAT.fieldsWriter(state),
+            rawVectorFormat.fieldsWriter(state),
             KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER
         );
     }
@@ -59,11 +73,12 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
     @Override
     public String toString() {
         return String.format(
+            Locale.ROOT,
             "%s(encoding=%s, scorer=%s, rawVectorFormat=%s)",
             getClass().getSimpleName(),
             encoding,
             KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER,
-            RAW_VECTOR_FORMAT
+            rawVectorFormat
         );
     }
 
@@ -71,7 +86,7 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
     public FlatVectorsReader fieldsReader(SegmentReadState state) throws IOException {
         return new Lucene104ScalarQuantizedVectorsReader(
             state,
-            RAW_VECTOR_FORMAT.fieldsReader(state),
+            rawVectorFormat.fieldsReader(state),
             KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER
         );
     }
@@ -83,6 +98,6 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
 
     @Override
     public String getName() {
-        return getClass().getSimpleName();
+        return FORMAT_NAME;
     }
 }

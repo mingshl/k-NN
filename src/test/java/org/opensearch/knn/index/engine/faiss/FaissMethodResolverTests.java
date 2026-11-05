@@ -25,7 +25,9 @@ import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
+import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_PARAMETER_PQ_M;
+import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 
 public class FaissMethodResolverTests extends KNNTestCase {
 
@@ -52,6 +54,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
         );
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.INNER_PRODUCT, ENCODER_SQ, true);
 
+        // On V_3_9_0+, x16 without a user-provided encoder auto-resolves to SQ 2-bit (not BQ).
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
             KNNMethodConfigContext.builder()
@@ -63,19 +66,49 @@ public class FaissMethodResolverTests extends KNNTestCase {
             false,
             SpaceType.INNER_PRODUCT
         );
-        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.INNER_PRODUCT, QFrameBitEncoder.NAME, true);
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.INNER_PRODUCT, ENCODER_SQ, true);
 
+        // Pre-3.9 index (BWC path): x16 without a user-provided encoder still auto-resolves to BQ.
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
             KNNMethodConfigContext.builder()
                 .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
                 .compressionLevel(CompressionLevel.x16)
-                .versionCreated(Version.CURRENT)
+                .versionCreated(Version.V_3_8_0)
                 .build(),
             false,
             SpaceType.INNER_PRODUCT
         );
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.INNER_PRODUCT, QFrameBitEncoder.NAME, true);
+
+        // On V_3_9_0+, x8 without a user-provided encoder auto-resolves to SQ 4-bit (not BQ).
+        resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
+                .compressionLevel(CompressionLevel.x8)
+                .versionCreated(Version.CURRENT)
+                .build(),
+            false,
+            SpaceType.INNER_PRODUCT
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.INNER_PRODUCT, ENCODER_SQ, true);
+
+        // Pre-3.9 index (BWC path): x8 without a user-provided encoder still auto-resolves to BQ.
+        resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
+                .compressionLevel(CompressionLevel.x8)
+                .versionCreated(Version.V_3_8_0)
+                .build(),
+            false,
+            SpaceType.INNER_PRODUCT
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.INNER_PRODUCT, QFrameBitEncoder.NAME, true);
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             new KNNMethodContext(
@@ -167,6 +200,197 @@ public class FaissMethodResolverTests extends KNNTestCase {
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.L2, QFrameBitEncoder.NAME, true);
     }
 
+    public void testResolveMethod_whenHalfFloatUnconfigured_thenX1WithFlatEncoder() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(null, halfFloatConfig().build(), false, SpaceType.L2);
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+    }
+
+    public void testResolveMethod_whenHalfFloatX1_thenFlatEncoder() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().compressionLevel(CompressionLevel.x1).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+    }
+
+    public void testResolveMethod_whenHalfFloatX16_thenSQOneBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().compressionLevel(CompressionLevel.x16).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.L2, ENCODER_SQ, false);
+        assertEquals(1, encoderParams(resolvedMethodContext).get(SQ_BITS));
+    }
+
+    public void testResolveMethod_whenHalfFloatX8_thenSQTwoBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().compressionLevel(CompressionLevel.x8).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.L2, ENCODER_SQ, false);
+        assertEquals(2, encoderParams(resolvedMethodContext).get(SQ_BITS));
+    }
+
+    public void testResolveMethod_whenHalfFloatX4_thenSQFourBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().compressionLevel(CompressionLevel.x4).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x4, SpaceType.L2, ENCODER_SQ, false);
+        assertEquals(4, encoderParams(resolvedMethodContext).get(SQ_BITS));
+    }
+
+    public void testResolveMethod_whenHalfFloatWithFloatOnlyCompression_thenThrows() {
+        for (CompressionLevel unsupported : java.util.List.of(CompressionLevel.x2, CompressionLevel.x32)) {
+            expectThrows(
+                ValidationException.class,
+                () -> TEST_RESOLVER.resolveMethod(null, halfFloatConfig().compressionLevel(unsupported).build(), false, SpaceType.L2)
+            );
+        }
+    }
+
+    // half_float is configured through compression_level alone, so naming an encoder is an error even
+    // when it asks for the same thing 16x/8x/4x resolves to internally.
+    public void testResolveMethod_whenHalfFloatWithExplicitEncoder_thenThrows() {
+        for (int bits : new int[] { 1, 2, 4, 16 }) {
+            ValidationException e = expectThrows(
+                ValidationException.class,
+                () -> TEST_RESOLVER.resolveMethod(halfFloatSQContext(bits), halfFloatConfig().build(), false, SpaceType.L2)
+            );
+            assertTrue(e.getMessage().contains(METHOD_ENCODER_PARAMETER));
+            assertTrue(e.getMessage().contains(VectorDataType.HALF_FLOAT.getValue()));
+        }
+    }
+
+    public void testResolveMethod_whenHalfFloatWithExplicitEncoderAndCompression_thenThrows() {
+        expectThrows(
+            ValidationException.class,
+            () -> TEST_RESOLVER.resolveMethod(
+                halfFloatSQContext(1),
+                halfFloatConfig().compressionLevel(CompressionLevel.x16).build(),
+                false,
+                SpaceType.L2
+            )
+        );
+    }
+
+    // FLOAT is unaffected - naming an encoder there is still how you configure it.
+    public void testResolveMethod_whenFloatWithExplicitEncoder_thenStillResolves() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            new KNNMethodContext(
+                KNNEngine.FAISS,
+                SpaceType.L2,
+                new MethodComponentContext(
+                    METHOD_HNSW,
+                    Map.of(METHOD_ENCODER_PARAMETER, new MethodComponentContext(ENCODER_SQ, Map.of(SQ_BITS, 1)))
+                )
+            ),
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).dimension(8).versionCreated(Version.CURRENT).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.L2, ENCODER_SQ, false);
+    }
+
+    private KNNMethodContext halfFloatSQContext(int bits) {
+        return new KNNMethodContext(
+            KNNEngine.FAISS,
+            SpaceType.L2,
+            new MethodComponentContext(
+                METHOD_HNSW,
+                Map.of(METHOD_ENCODER_PARAMETER, new MethodComponentContext(ENCODER_SQ, Map.of(SQ_BITS, bits)))
+            )
+        );
+    }
+
+    // ON_DISK is where x32 could leak in: AbstractMethodResolver#getDefaultCompressionLevel returns x32
+    // for any 3.6+ on-disk field with no compression configured, and x32 has no half_float meaning.
+    // ON_DISK means "quantize as far as this data type goes": x16 for half_float, the counterpart of
+    // FLOAT's ON_DISK -> x32. x32 itself is never reachable here - half_float does not support it.
+    public void testResolveMethod_whenHalfFloatOnDiskUnconfigured_thenX16WithSQOneBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().mode(Mode.ON_DISK).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.L2, ENCODER_SQ, false);
+        assertEquals(1, encoderParams(resolvedMethodContext).get(SQ_BITS));
+    }
+
+    // Faiss FLOAT accepts ON_DISK + x1 (unlike Lucene HNSW), so half_float matches its own engine.
+    public void testResolveMethod_whenHalfFloatOnDiskWithX1_thenX1() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x1).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+    }
+
+    public void testResolveMethod_whenHalfFloatInMemoryUnconfigured_thenX1() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().mode(Mode.IN_MEMORY).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+    }
+
+    public void testResolveMethod_whenHalfFloatOnDiskX16_thenSQOneBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            halfFloatConfig().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x16).build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x16, SpaceType.L2, ENCODER_SQ, false);
+        assertEquals(1, encoderParams(resolvedMethodContext).get(SQ_BITS));
+    }
+
+    public void testResolveMethod_whenHalfFloatOnDiskX32_thenThrows() {
+        expectThrows(
+            ValidationException.class,
+            () -> TEST_RESOLVER.resolveMethod(
+                null,
+                halfFloatConfig().mode(Mode.ON_DISK).compressionLevel(CompressionLevel.x32).build(),
+                false,
+                SpaceType.L2
+            )
+        );
+    }
+
+    private KNNMethodConfigContext.KNNMethodConfigContextBuilder halfFloatConfig() {
+        return KNNMethodConfigContext.builder().vectorDataType(VectorDataType.HALF_FLOAT).dimension(8).versionCreated(Version.CURRENT);
+    }
+
+    private Map<String, Object> encoderParams(ResolvedMethodContext resolvedMethodContext) {
+        return ((MethodComponentContext) resolvedMethodContext.getKnnMethodContext()
+            .getMethodComponentContext()
+            .getParameters()
+            .get(METHOD_ENCODER_PARAMETER)).getParameters();
+    }
+
     private void validateResolveMethodContext(
         ResolvedMethodContext resolvedMethodContext,
         CompressionLevel expectedCompression,
@@ -185,13 +409,17 @@ public class FaissMethodResolverTests extends KNNTestCase {
                 .get(METHOD_ENCODER_PARAMETER)).getName()
         );
         if (checkBitsEncoderParam) {
-            assertEquals(
-                expectedCompression.numBitsForFloat32(),
-                ((MethodComponentContext) resolvedMethodContext.getKnnMethodContext()
-                    .getMethodComponentContext()
-                    .getParameters()
-                    .get(METHOD_ENCODER_PARAMETER)).getParameters().get(QFrameBitEncoder.BITCOUNT_PARAM)
-            );
+            MethodComponentContext encoderCtx = (MethodComponentContext) resolvedMethodContext.getKnnMethodContext()
+                .getMethodComponentContext()
+                .getParameters()
+                .get(METHOD_ENCODER_PARAMETER);
+            if (ENCODER_SQ.equals(expectedEncoderName)) {
+                // Faiss SQ writes bits under SQ_BITS; validate it matches the expected compression.
+                assertEquals(expectedCompression.numBitsForFloat32(), encoderCtx.getParameters().get(SQ_BITS));
+            } else {
+                // Faiss BQ (QFrame) writes bits under BITCOUNT_PARAM.
+                assertEquals(expectedCompression.numBitsForFloat32(), encoderCtx.getParameters().get(QFrameBitEncoder.BITCOUNT_PARAM));
+            }
         }
 
     }
@@ -359,7 +587,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
     }
 
     public void testResolveMethod_whenNoCompressionSpecified_thenResolvesToX1() {
-        // TODO: [DEFAULT_FLIP] After Step 4, assert CompressionLevel.x32 for V_3_7_0+, keep x1 for older versions
+        // TODO: [DEFAULT_FLIP] After Step 4, assert CompressionLevel.x32 for V_3_8_0+, keep x1 for older versions
         ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
             KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).versionCreated(Version.CURRENT).build(),
@@ -443,8 +671,8 @@ public class FaissMethodResolverTests extends KNNTestCase {
     }
 
     public void testResolveMethod_whenNoCompressionAcrossVersions_thenAlwaysResolvesToX1() {
-        // TODO: [DEFAULT_FLIP] After Step 4, split into: indexVersionCreated < V_3_7_0 → assert x1,
-        // indexVersionCreated >= V_3_7_0 → assert x32
+        // TODO: [DEFAULT_FLIP] After Step 4, split into: indexVersionCreated < V_3_8_0 → assert x1,
+        // indexVersionCreated >= V_3_8_0 → assert x32
         Version[] versions = new Version[] { Version.V_3_5_0, Version.V_3_6_0, Version.V_3_7_0, Version.CURRENT };
 
         for (Version version : versions) {

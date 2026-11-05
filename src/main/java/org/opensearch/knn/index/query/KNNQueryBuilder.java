@@ -13,6 +13,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
+import org.opensearch.action.search.SearchRequest;
 import org.opensearch.common.ValidationException;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.common.Strings;
@@ -23,6 +24,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilderVisitor;
+import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.WithFieldName;
@@ -35,16 +37,20 @@ import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.engine.MethodComponentContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.model.QueryContext;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.query.parser.RescoreParser;
+import org.opensearch.knn.index.query.request.MethodParameter;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.indices.ModelMetadata;
 import org.opensearch.knn.indices.ModelUtil;
+import org.opensearch.search.SearchService;
+import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -116,6 +122,16 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     private Boolean expandNested;
 
     /**
+     * {@code size} of the enclosing search request, stamped on the coordinator by
+     * {@link #doRewrite(QueryRewriteContext)} and used by quantized radial search to bound the
+     * oversampled first pass. Internal only, not part of the query DSL. {@code null} for
+     * non-radial queries and whenever it cannot be resolved, in which case the radial path falls
+     * back to {@code max_result_window}.
+     */
+    @Getter
+    private Integer size;
+
+    /**
      * Constructs a new query with the given field name and vector
      *
      * @param fieldName Name of the field
@@ -125,13 +141,13 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     @Deprecated
     public KNNQueryBuilder(String fieldName, float[] vector) {
         if (Strings.isNullOrEmpty(fieldName)) {
-            throw new IllegalArgumentException(String.format("[%s] requires fieldName", NAME));
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] requires fieldName", NAME));
         }
         if (vector == null) {
-            throw new IllegalArgumentException(String.format("[%s] requires query vector", NAME));
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] requires query vector", NAME));
         }
         if (vector.length == 0) {
-            throw new IllegalArgumentException(String.format("[%s] query vector is empty", NAME));
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] query vector is empty", NAME));
         }
         this.fieldName = fieldName;
         this.vector = vector;
@@ -156,6 +172,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         private float boost = DEFAULT_BOOST;
         private RescoreContext rescoreContext;
         private Boolean expandNested;
+        private Integer size;
 
         public Builder() {}
 
@@ -219,6 +236,12 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             return this;
         }
 
+        /** Internal only, see {@link KNNQueryBuilder#getSize()}. */
+        public Builder size(Integer size) {
+            this.size = size;
+            return this;
+        }
+
         public KNNQueryBuilder build() {
             validate();
             return new KNNQueryBuilder(
@@ -231,7 +254,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 filter,
                 ignoreUnmapped,
                 rescoreContext,
-                expandNested
+                expandNested,
+                size
             ).boost(boost).queryName(queryName);
         }
 
@@ -357,6 +381,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         methodParameters = builder.methodParameters;
         rescoreContext = builder.rescoreContext;
         expandNested = builder.expandNested;
+        size = builder.size;
     }
 
     @Override
@@ -407,6 +432,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .ignoreUnmapped(ignoreUnmapped)
                 .rescoreContext(rescoreContext)
                 .expandNested(expandNested)
+                .size(size)
                 .build();
         }
 
@@ -421,6 +447,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             .ignoreUnmapped(ignoreUnmapped)
             .rescoreContext(rescoreContext)
             .expandNested(expandNested)
+            .size(size)
             .build();
     }
 
@@ -449,7 +476,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         MethodComponentContext methodComponentContext = queryConfigFromMapping.getMethodComponentContext();
         SpaceType spaceType = queryConfigFromMapping.getSpaceType();
         VectorDataType vectorDataType = queryConfigFromMapping.getVectorDataType();
-        RescoreContext processedRescoreContext = knnVectorFieldType.resolveRescoreContext(rescoreContext);
+        RescoreContext processedRescoreContext = resolveRescore(knnVectorFieldType, rescoreContext);
         // Transform the query vector if it's required. It will return `vector` itself if transform is not needed.
         // Otherwise, it will return a new transformed vector.
         final float[] transformedQueryVector = knnVectorFieldType.transformQueryVector(vector);
@@ -481,10 +508,30 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                     )
                 );
             }
+        } else if (methodParameters != null && methodParameters.isEmpty() == false) {
+            // No engine method context is resolvable here, so the engine-aware validation above cannot run;
+            // reject engine-contributed (non-core) names rather than silently ignoring them.
+            for (String parameterName : methodParameters.keySet()) {
+                if (MethodParameter.enumOf(parameterName) == null) {
+                    throw new IllegalArgumentException(String.format(Locale.ROOT, "unknown method parameter found [%s]", parameterName));
+                }
+            }
         }
 
         if (this.maxDistance != null || this.minScore != null) {
-            knnVectorFieldType.validateSupportRadialSearch(knnEngine);
+            ResolvedIndexSpec spec = knnVectorFieldType.getResolvedSpec();
+            if (!spec.supportsRadialSearch()) {
+                throw new UnsupportedOperationException(
+                    String.format(
+                        Locale.ROOT,
+                        "Radial search is not supported for this configuration: engine=%s, data_type=%s, method=%s, compression=%s",
+                        spec.getEngine(),
+                        spec.getVectorDataType(),
+                        spec.getMethodName(),
+                        spec.getCompressionLevel().getName()
+                    )
+                );
+            }
         }
 
         // Currently, k-NN supports distance and score types radial search
@@ -493,7 +540,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         if (this.maxDistance != null) {
             if (this.maxDistance < 0 && SpaceType.INNER_PRODUCT.equals(spaceType) == false) {
                 throw new IllegalArgumentException(
-                    String.format("[" + NAME + "] requires distance to be non-negative for space type: %s", spaceType)
+                    String.format(Locale.ROOT, "[" + NAME + "] requires distance to be non-negative for space type: %s", spaceType)
                 );
             }
             if (memoryOptimizedSearchEnabled) {
@@ -506,7 +553,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         if (this.minScore != null) {
             if (this.minScore > 1 && SpaceType.INNER_PRODUCT.equals(spaceType) == false) {
                 throw new IllegalArgumentException(
-                    String.format("[" + NAME + "] requires score to be in the range [0, 1] for space type: %s", spaceType)
+                    String.format(Locale.ROOT, "[" + NAME + "] requires score to be in the range [0, 1] for space type: %s", spaceType)
                 );
             }
             if (memoryOptimizedSearchEnabled) {
@@ -520,6 +567,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         if (knnMappingConfig.getDimension() != vectorLength) {
             throw new IllegalArgumentException(
                 String.format(
+                    Locale.ROOT,
                     "Query vector has invalid dimension: %d. Dimension should be: %d",
                     vectorLength,
                     knnMappingConfig.getDimension()
@@ -541,9 +589,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 spaceType.validateVector(vector);
         }
 
-        if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(knnEngine)
-            && filter != null
-            && !KNNEngine.getEnginesThatSupportsFilters().contains(knnEngine)) {
+        if (knnEngine.createsCustomSegmentFiles() && filter != null && !knnEngine.supportsFilters()) {
             throw new IllegalArgumentException(String.format(Locale.ROOT, "Engine [%s] does not support filters", knnEngine));
         }
 
@@ -556,6 +602,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .originalVector(vector)
                 .byteVector(getByteVectorForCreatingQueryRequest(vectorDataType, byteVector))
                 .vectorDataType(vectorDataType)
+                .spaceType(spaceType)
                 .k(this.k)
                 .methodParameters(this.methodParameters)
                 .filter(this.filter)
@@ -575,11 +622,15 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .originalVector(vector)
                 .byteVector(getByteVectorForCreatingQueryRequest(vectorDataType, byteVector))
                 .vectorDataType(vectorDataType)
+                .spaceType(spaceType)
                 .vectorFieldType(knnVectorFieldType)
                 .radius(radius)
                 .methodParameters(this.methodParameters)
                 .filter(this.filter)
                 .context(context)
+                .size(this.size)
+                .rescoreContext(processedRescoreContext)
+                .expandNested(expandNested == null ? false : expandNested)
                 .memoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
                 .build();
             return RNNQueryFactory.create(createQueryRequest);
@@ -658,7 +709,9 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         KNNEngine knnEngine
     ) {
 
-        if ((VectorDataType.FLOAT == vectorDataType) || (VectorDataType.BYTE == vectorDataType && FAISS == knnEngine)) {
+        if ((VectorDataType.FLOAT == vectorDataType)
+            || (VectorDataType.HALF_FLOAT == vectorDataType)
+            || (VectorDataType.BYTE == vectorDataType && FAISS == knnEngine)) {
             return transformedVector;
         }
         return null;
@@ -701,7 +754,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             && Objects.equals(filter, other.filter)
             && Objects.equals(ignoreUnmapped, other.ignoreUnmapped)
             && Objects.equals(rescoreContext, other.rescoreContext)
-            && Objects.equals(expandNested, other.expandNested);
+            && Objects.equals(expandNested, other.expandNested)
+            && Objects.equals(size, other.size);
     }
 
     @Override
@@ -716,7 +770,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             maxDistance,
             minScore,
             rescoreContext,
-            expandNested
+            expandNested,
+            size
         );
     }
 
@@ -726,27 +781,59 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     }
 
     @Override
-    protected QueryBuilder doRewrite(QueryRewriteContext queryShardContext) throws IOException {
-        QueryBuilder rewrittenFilter;
-        if (Objects.nonNull(filter)) {
-            rewrittenFilter = filter.rewrite(queryShardContext);
-            if (rewrittenFilter != filter) {
-                KNNQueryBuilder rewrittenQueryBuilder = KNNQueryBuilder.builder()
-                    .fieldName(this.fieldName)
-                    .vector(this.vector)
-                    .k(this.k)
-                    .maxDistance(this.maxDistance)
-                    .minScore(this.minScore)
-                    .methodParameters(this.methodParameters)
-                    .filter(rewrittenFilter)
-                    .ignoreUnmapped(this.ignoreUnmapped)
-                    .rescoreContext(this.rescoreContext)
-                    .expandNested(this.expandNested)
-                    .build();
-                return rewrittenQueryBuilder;
-            }
+    protected QueryBuilder doRewrite(QueryRewriteContext queryRewriteContext) throws IOException {
+        final QueryBuilder rewrittenFilter = Objects.nonNull(filter) ? filter.rewrite(queryRewriteContext) : filter;
+        final Integer resolvedSize = resolveSize(queryRewriteContext);
+
+        if (rewrittenFilter != filter || resolvedSize != null) {
+            return KNNQueryBuilder.builder()
+                .fieldName(this.fieldName)
+                .vector(this.vector)
+                .k(this.k)
+                .maxDistance(this.maxDistance)
+                .minScore(this.minScore)
+                .methodParameters(this.methodParameters)
+                .filter(rewrittenFilter)
+                .ignoreUnmapped(this.ignoreUnmapped)
+                .rescoreContext(this.rescoreContext)
+                .expandNested(this.expandNested)
+                .size(resolvedSize != null ? resolvedSize : this.size)
+                .boost(this.boost)
+                .queryName(this.queryName)
+                .build();
         }
-        return super.doRewrite(queryShardContext);
+        return super.doRewrite(queryRewriteContext);
+    }
+
+    /**
+     * Resolves the enclosing request's {@code size}, for radial queries only. Only
+     * {@link QueryCoordinatorContext} exposes the originating request, and the coordinator rewrites the
+     * whole tree, so this also resolves for a radial query nested inside a {@code bool}.
+     *
+     * @return the size, or {@code null} when there is nothing to stamp: a non-radial query, a size
+     *         already stamped (the rewrite must be idempotent), or no coordinator context
+     */
+    private Integer resolveSize(final QueryRewriteContext queryRewriteContext) {
+        if (size != null || (maxDistance == null && minScore == null)) {
+            return null;
+        }
+        final QueryCoordinatorContext coordinatorContext = queryRewriteContext.convertToCoordinatorContext();
+        if (coordinatorContext == null || !(coordinatorContext.getSearchRequest() instanceof SearchRequest searchRequest)) {
+            return null;
+        }
+        final SearchSourceBuilder source = searchRequest.source();
+        if (source == null) {
+            return null;
+        }
+        // SearchSourceBuilder#size returns -1 when the user did not set one; core then applies
+        // SearchService.DEFAULT_SIZE, so resolve it the same way here.
+        final int resolvedSize = source.size() == -1 ? SearchService.DEFAULT_SIZE : source.size();
+        // size == 0 is an aggregation-only request, so there is nothing to bound.
+        return resolvedSize <= 0 ? null : resolvedSize;
+    }
+
+    private static RescoreContext resolveRescore(KNNVectorFieldType fieldType, RescoreContext userContext) {
+        return fieldType.resolveRescoreContext(userContext);
     }
 
     @Getter

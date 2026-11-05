@@ -11,6 +11,9 @@ import org.opensearch.Version;
 import org.opensearch.common.Explicit;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
+
+import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 
 import java.util.Map;
 
@@ -38,7 +41,13 @@ public class FlatVectorFieldMapper extends KNNVectorFieldMapper {
             fullname,
             metaValue,
             knnMethodConfigContext.getVectorDataType(),
-            knnMethodConfigContext::getDimension
+            knnMethodConfigContext::getDimension,
+            knnMethodConfigContext.getVersionCreated(),
+            ResolvedIndexSpec.noAnn(
+                knnMethodConfigContext.getVectorDataType(),
+                knnMethodConfigContext.getDimension(),
+                knnMethodConfigContext.getVersionCreated()
+            )
         );
         return new FlatVectorFieldMapper(
             simpleName,
@@ -80,6 +89,9 @@ public class FlatVectorFieldMapper extends KNNVectorFieldMapper {
         this.perDimensionValidator = selectPerDimensionValidator(vectorDataType);
         this.fieldType = new FieldType(KNNVectorFieldMapper.Defaults.FIELD_TYPE);
         this.fieldType.setDocValuesType(DocValuesType.BINARY);
+        if (VectorDataType.HALF_FLOAT == vectorDataType) {
+            this.fieldType.putAttribute(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue());
+        }
         this.fieldType.freeze();
     }
 
@@ -90,6 +102,10 @@ public class FlatVectorFieldMapper extends KNNVectorFieldMapper {
 
         if (VectorDataType.BYTE == vectorDataType) {
             return PerDimensionValidator.DEFAULT_BYTE_VALIDATOR;
+        }
+
+        if (VectorDataType.HALF_FLOAT == vectorDataType) {
+            return PerDimensionValidator.DEFAULT_HALF_FLOAT_VALIDATOR;
         }
 
         return PerDimensionValidator.DEFAULT_FLOAT_VALIDATOR;

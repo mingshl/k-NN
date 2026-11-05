@@ -5,6 +5,8 @@
 
 package org.opensearch.knn.index;
 
+import java.util.Locale;
+
 import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.opensearch.client.Response;
@@ -16,7 +18,6 @@ import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.KNNResult;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.knn.plugin.stats.StatNames;
-import org.opensearch.knn.common.annotation.ExpectRemoteBuildValidation;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -36,7 +37,6 @@ public class KNNESSettingsTestIT extends KNNRestTestCase {
 
     public static final int ALWAYS_BUILD_GRAPH = 0;
 
-    @ExpectRemoteBuildValidation
     public void testKNNLegacySpaceTypeIndexingTest() throws IOException, ParseException {
         // Configure space_type at index level. This is deprecated and will be removed in the future.
         final Settings indexSettings = Settings.builder().put("index.knn", true).put("knn.algo_param.ef_search", 100).build();
@@ -154,7 +154,7 @@ public class KNNESSettingsTestIT extends KNNRestTestCase {
             ResponseException.class,
             () -> updateIndexSettings(INDEX_NAME, Settings.builder().put(KNNSettings.KNN_INDEX, false))
         );
-        assertThat(ex.getMessage(), containsString(String.format("final %s setting [index.knn], not updateable", INDEX_NAME)));
+        assertThat(ex.getMessage(), containsString(String.format(Locale.ROOT, "final %s setting [index.knn], not updateable", INDEX_NAME)));
 
     }
 

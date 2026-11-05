@@ -16,6 +16,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TaskExecutor;
+import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
@@ -217,7 +218,8 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
             Weight actual = objectUnderTest.createWeight(searcher, scoreMode, 1);
 
             // Then
-            Query expected = QueryUtils.getInstance().createDocAndScoreQuery(reader, expectedTopDocs);
+            Query expected = QueryUtils.getInstance()
+                .createDocAndScoreQuery(reader, expectedTopDocs, (QueryUtils.ScoreExplainer) (context, doc, score) -> null);
             assertEquals(expected, actual.getQuery());
         }
     }
@@ -257,7 +259,8 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
             Weight actual = objectUnderTest.createWeight(searcher, scoreMode, 1);
 
             // Then
-            Query expected = QueryUtils.getInstance().createDocAndScoreQuery(reader, expectedTopDocs);
+            Query expected = QueryUtils.getInstance()
+                .createDocAndScoreQuery(reader, expectedTopDocs, (QueryUtils.ScoreExplainer) (context, doc, score) -> null);
             assertEquals(expected, actual.getQuery());
             for (ScoreDoc scoreDoc : expectedTopDocs.scoreDocs) {
                 int docId = scoreDoc.doc;
@@ -386,7 +389,8 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
             Weight actual = objectUnderTest.createWeight(searcher, scoreMode, boost);
 
             // Then
-            Query expected = QueryUtils.getInstance().createDocAndScoreQuery(reader, expectedTopDocs);
+            Query expected = QueryUtils.getInstance()
+                .createDocAndScoreQuery(reader, expectedTopDocs, (QueryUtils.ScoreExplainer) (context, doc, score) -> null);
             assertEquals(expected, actual.getQuery());
         }
     }
@@ -396,7 +400,7 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
         // Given
         List<LeafReaderContext> leaves = reader.leaves();
         leaf1 = leaves.get(0);
-        when(knnWeight.searchLeaf(leaf1, 4)).thenReturn(PerLeafResult.EMPTY_RESULT);
+        when(knnWeight.searchLeaf(leaf1, 4)).thenReturn(PerLeafResult.empty());
         when(knnQuery.getK()).thenReturn(4);
 
         try (MockedStatic<KNNSettings> mockedKnnSettings = mockStatic(KNNSettings.class)) {
@@ -497,7 +501,8 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
             // Verify
             TopDocs[] topDocs = { topDocs1, topDocs2 };
             TopDocs expectedTopDocs = TopDocs.merge(k, topDocs);
-            Query expected = QueryUtils.getInstance().createDocAndScoreQuery(reader, expectedTopDocs);
+            Query expected = QueryUtils.getInstance()
+                .createDocAndScoreQuery(reader, expectedTopDocs, (QueryUtils.ScoreExplainer) (context, doc, score) -> null);
             assertEquals(expected, actual.getQuery());
         }
     }
@@ -935,7 +940,11 @@ public class NativeEngineKNNVectorQueryTests extends OpenSearchTestCase {
                 Field delegateField = ReentrantKnnCollectorManager.class.getDeclaredField("knnCollectorManager");
                 delegateField.setAccessible(true);
 
-                Object delegate = delegateField.get(reentrantKnnCollectorManager);
+                // The second pass is always wrapped in a TimeLimitingKnnCollectorManager; read `k` from its delegate.
+                final Object timeLimited = delegateField.get(reentrantKnnCollectorManager);
+                Field timeLimitedDelegateField = TimeLimitingKnnCollectorManager.class.getDeclaredField("delegate");
+                timeLimitedDelegateField.setAccessible(true);
+                Object delegate = timeLimitedDelegateField.get(timeLimited);
                 Field kField = delegate.getClass().getDeclaredField("k");
                 kField.setAccessible(true);
 

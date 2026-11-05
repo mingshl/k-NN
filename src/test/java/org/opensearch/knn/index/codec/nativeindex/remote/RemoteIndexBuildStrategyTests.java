@@ -23,8 +23,14 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.common.exception.TerminalIOException;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.nativeindex.IndexBuildAbortedException;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
+import org.opensearch.knn.index.engine.Encoder;
+import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
+import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.store.IndexOutputWithBuffer;
+import org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory;
 import org.opensearch.knn.plugin.stats.KNNRemoteIndexBuildValue;
 import org.opensearch.remoteindexbuild.model.RemoteBuildRequest;
 import org.opensearch.repositories.RepositoriesService;
@@ -35,6 +41,7 @@ import java.io.IOException;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
@@ -65,6 +72,8 @@ import static org.opensearch.remoteindexbuild.constants.KNNRemoteConstants.VECTO
 
 public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
     private static final String TEST_INDEX = "test-index";
+    // A dimension at/above the remote-build threshold, so it is never the reason shouldBuildIndexRemotely returns false.
+    private static final int VALID_DIMENSION = KNNConstants.MIN_DIMENSIONS_FOR_REMOTE_INDEX_BUILD;
     public static final String MOCK_BASE_PATH = "vectors/1_1_25";
     public static final String MOCK_UUID = "SIRKos4rOWlMA62PX2p75m";
     public static final String VECTORS_PATH = "_vectors";
@@ -122,6 +131,40 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
 
         assertThrows(TerminalIOException.class, () -> { objectUnderTest.buildAndWriteIndex(buildIndexParams); });
         assertFalse(fallback.get());
+        // A terminal termination is benign and must not be counted as a build failure.
+        assertEquals(0L, (long) KNNRemoteIndexBuildValue.INDEX_BUILD_FAILURE_COUNT.getValue());
+        assertEquals(1L, (long) KNNRemoteIndexBuildValue.INDEX_BUILD_TERMINAL_EXCEPTION.getValue());
+    }
+
+    /**
+     * Test that we do not fall back to the fallback BuildStrategy when an IndexBuildAbortedException is thrown.
+     * This simulates a merge abort during remote index build - the exception should propagate up
+     * rather than falling back to local build.
+     */
+    public void testRemoteIndexBuildStrategyAbortDoesNotFallback() throws IOException {
+        final SetOnce<Boolean> fallback = new SetOnce<>(Boolean.FALSE);
+
+        RemoteIndexBuildStrategy objectUnderTest = spy(
+            new RemoteIndexBuildStrategy(
+                () -> mock(RepositoriesService.class),
+                new TestIndexBuildStrategy(fallback),
+                mock(IndexSettings.class),
+                null
+            )
+        );
+
+        // Use doAnswer rather than doThrow: IndexBuildAbortedException is not assignable to the
+        // TerminalIOException declared by getRepositoryContext, so doThrow's checked-exception validation
+        // would reject it. The JVM does not enforce checked exceptions at runtime, and buildAndWriteIndex
+        // declares throws IOException, so the abort propagates just as it would from the polling phase.
+        doAnswer(invocation -> { throw new IndexBuildAbortedException("Merge aborted during remote index build"); }).when(objectUnderTest)
+            .getRepositoryContext(any());
+
+        assertThrows(IndexBuildAbortedException.class, () -> { objectUnderTest.buildAndWriteIndex(buildIndexParams); });
+        assertFalse(fallback.get());
+        // A merge abort is a benign cancellation and must not be counted as a build failure.
+        assertEquals(0L, (long) KNNRemoteIndexBuildValue.INDEX_BUILD_FAILURE_COUNT.getValue());
+        assertEquals(1L, (long) KNNRemoteIndexBuildValue.INDEX_BUILD_MERGE_ABORT_EXCEPTION.getValue());
     }
 
     /**
@@ -256,13 +299,13 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
         Index index = mock(Index.class);
         when(index.getName()).thenReturn(TEST_INDEX);
         // Check index settings null
-        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(null, 0));
+        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(null, 0, VALID_DIMENSION));
 
         // Check index setting disabled
         indexSettings = mock(IndexSettings.class);
         when(indexSettings.getValue(KNN_INDEX_REMOTE_VECTOR_BUILD_SETTING)).thenReturn(false);
         when(indexSettings.getIndex()).thenReturn(index);
-        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, 0));
+        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, 0, VALID_DIMENSION));
 
         // Check repo not configured
         indexSettings = mock(IndexSettings.class);
@@ -272,12 +315,12 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
         when(clusterSettings.get(KNN_REMOTE_VECTOR_REPOSITORY_SETTING)).thenReturn("");
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
         KNNSettings.state().setClusterService(clusterService);
-        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, 0));
+        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, 0, VALID_DIMENSION));
 
         // Check size threshold
         int BYTE_SIZE = randomIntBetween(50, 1000);
         when(indexSettings.getValue(KNN_INDEX_REMOTE_VECTOR_BUILD_SIZE_MIN_SETTING)).thenReturn(new ByteSizeValue(BYTE_SIZE));
-        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, randomInt(BYTE_SIZE - 1)));
+        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, randomInt(BYTE_SIZE - 1), VALID_DIMENSION));
 
         // Check happy path
         clusterSettings = mock(ClusterSettings.class);
@@ -285,8 +328,33 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
         KNNSettings.state().setClusterService(clusterService);
         when(clusterSettings.get(KNN_REMOTE_VECTOR_BUILD_SIZE_MAX_SETTING)).thenReturn(new ByteSizeValue(BYTE_SIZE * 3L));
-        assertTrue(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, randomIntBetween(BYTE_SIZE, BYTE_SIZE * 2)));
-        assertFalse(RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, randomIntBetween(BYTE_SIZE * 3 + 1, BYTE_SIZE * 4)));
+        assertTrue(
+            RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, randomIntBetween(BYTE_SIZE, BYTE_SIZE * 2), VALID_DIMENSION)
+        );
+        assertFalse(
+            RemoteIndexBuildStrategy.shouldBuildIndexRemotely(
+                indexSettings,
+                randomIntBetween(BYTE_SIZE * 3 + 1, BYTE_SIZE * 4),
+                VALID_DIMENSION
+            )
+        );
+
+        // Check dimension threshold: below MIN_DIMENSIONS_FOR_REMOTE_INDEX_BUILD -> false, at/above -> true
+        int validBlobLength = randomIntBetween(BYTE_SIZE, BYTE_SIZE * 2);
+        assertFalse(
+            RemoteIndexBuildStrategy.shouldBuildIndexRemotely(
+                indexSettings,
+                validBlobLength,
+                KNNConstants.MIN_DIMENSIONS_FOR_REMOTE_INDEX_BUILD - 1
+            )
+        );
+        assertTrue(
+            RemoteIndexBuildStrategy.shouldBuildIndexRemotely(
+                indexSettings,
+                validBlobLength,
+                KNNConstants.MIN_DIMENSIONS_FOR_REMOTE_INDEX_BUILD
+            )
+        );
     }
 
     public void testFilePathConstruction() {
@@ -315,12 +383,21 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
     }
 
     public void testBuildRequest() throws IOException {
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .compressionLevel(CompressionLevel.NOT_CONFIGURED)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
         RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
             createTestIndexSettings(),
             buildIndexParams,
             createTestRepositoryMetadata(),
             MOCK_FULL_PATH,
-            getMockParameterMap()
+            getMockParameterMap(),
+            resolvedSpec
         );
         assertEquals(S3, request.getRepositoryType());
         assertEquals(TEST_BUCKET, request.getContainerName());
@@ -335,27 +412,203 @@ public class RemoteIndexBuildStrategyTests extends RemoteIndexBuildTests {
     }
 
     public void testBuildRequestSQOneBit() throws IOException {
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .compressionLevel(CompressionLevel.x32)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
         RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
             createTestIndexSettings(),
             buildIndexParams,
             createTestRepositoryMetadata(),
             MOCK_FULL_PATH,
-            getMockSQOneBitParameterMap()
+            getMockSQOneBitParameterMap(),
+            resolvedSpec
         );
         assertEquals(VectorDataType.FLOAT.getValue(), request.getVectorDataType());
         assertTrue(request.isSkipStoredVectors());
     }
 
-    public void testBuildRequestFP16() throws IOException {
+    public void testBuildRequestSQTwoBit() throws IOException {
+        // Same wire contract as SQ 1-bit: fp32 vectors uploaded, RVIB builds the HNSW graph over
+        // fp32 neighbors, data node stitches with locally-quantized .veq (2-bit) at search time.
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.TWO)
+            .compressionLevel(CompressionLevel.x16)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
         RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
             createTestIndexSettings(),
             buildIndexParams,
             createTestRepositoryMetadata(),
             MOCK_FULL_PATH,
-            getMockFP16ParameterMap()
+            getMockSQParameterMap(2),
+            resolvedSpec
+        );
+        assertEquals(VectorDataType.FLOAT.getValue(), request.getVectorDataType());
+        assertTrue(request.isSkipStoredVectors());
+    }
+
+    public void testBuildRequestSQFourBit() throws IOException {
+        // Same wire contract as SQ 1-bit/2-bit — the data node quantizes to 4-bit codes locally
+        // and uploads fp32 to RVIB, which produces an HNSW graph over the fp32 neighbors.
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x8)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
+        RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
+            createTestIndexSettings(),
+            buildIndexParams,
+            createTestRepositoryMetadata(),
+            MOCK_FULL_PATH,
+            getMockSQParameterMap(4),
+            resolvedSpec
+        );
+        assertEquals(VectorDataType.FLOAT.getValue(), request.getVectorDataType());
+        assertTrue(request.isSkipStoredVectors());
+    }
+
+    public void testBuildRequestSQFP16_thenNoSkipStoredVectors() throws IOException {
+        // Sanity: fp16 is not the MOS path, so skipStoredVectors must remain false — RVIB writes
+        // its own flat storage in this case.
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+            .compressionLevel(CompressionLevel.x2)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
+        RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
+            createTestIndexSettings(),
+            buildIndexParams,
+            createTestRepositoryMetadata(),
+            MOCK_FULL_PATH,
+            getMockSQParameterMap(16),
+            resolvedSpec
+        );
+        assertFalse(request.isSkipStoredVectors());
+    }
+
+    private Map<String, Object> getMockSQParameterMap(int bits) {
+        Map<String, Object> encoderParams = Map.of(NAME, ENCODER_SQ, SQ_BITS, bits);
+        Map<String, Object> innerParams = Map.of(
+            METHOD_PARAMETER_EF_SEARCH,
+            24,
+            METHOD_PARAMETER_EF_CONSTRUCTION,
+            28,
+            METHOD_PARAMETER_M,
+            12,
+            METHOD_ENCODER_PARAMETER,
+            encoderParams
+        );
+        return Map.of(
+            INDEX_DESCRIPTION_PARAMETER,
+            "HNSW12,Flat",
+            SPACE_TYPE,
+            INNER_PRODUCT.getValue(),
+            NAME,
+            METHOD_HNSW,
+            VECTOR_DATA_TYPE_FIELD,
+            VectorDataType.FLOAT.getValue(),
+            PARAMETERS,
+            innerParams
+        );
+    }
+
+    public void testBuildRequestFP16() throws IOException {
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+            .compressionLevel(CompressionLevel.x2)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(2)
+            .build();
+        RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
+            createTestIndexSettings(),
+            buildIndexParams,
+            createTestRepositoryMetadata(),
+            MOCK_FULL_PATH,
+            getMockFP16ParameterMap(),
+            resolvedSpec
         );
         assertEquals("half_float", request.getVectorDataType());
         assertFalse(request.isSkipStoredVectors());
+    }
+
+    public void testBuildRequestHalfFloatFlat() throws IOException {
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.FLAT)
+            .compressionLevel(CompressionLevel.NOT_CONFIGURED)
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .dimension(2)
+            .build();
+        RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
+            createTestIndexSettings(),
+            halfFloatBuildIndexParams(),
+            createTestRepositoryMetadata(),
+            MOCK_FULL_PATH,
+            getMockParameterMap(),
+            resolvedSpec
+        );
+        assertEquals(VectorDataType.HALF_FLOAT.getValue(), request.getVectorDataType());
+        assertEquals(2, request.getDimension());
+        assertEquals(3, request.getDocCount());
+        assertFalse(request.isSkipStoredVectors());
+    }
+
+    public void testBuildRequestHalfFloatSQOneBit() throws IOException {
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .compressionLevel(CompressionLevel.x16)
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .dimension(2)
+            .build();
+        RemoteBuildRequest request = RemoteIndexBuildStrategy.buildRemoteBuildRequest(
+            createTestIndexSettings(),
+            halfFloatBuildIndexParams(),
+            createTestRepositoryMetadata(),
+            MOCK_FULL_PATH,
+            getMockSQOneBitParameterMap(),
+            resolvedSpec
+        );
+        assertEquals(VectorDataType.HALF_FLOAT.getValue(), request.getVectorDataType());
+        assertTrue(request.isSkipStoredVectors());
+    }
+
+    private BuildIndexParams halfFloatBuildIndexParams() {
+        return BuildIndexParams.builder()
+            .indexOutputWithBuffer(indexOutputWithBuffer)
+            .knnEngine(KNNEngine.FAISS)
+            .field(buildIndexParams.getField())
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .indexParameters(buildIndexParams.getIndexParameters())
+            .knnVectorValuesSupplier(KNNVectorValuesFactory.getVectorValuesSupplier(VectorDataType.HALF_FLOAT, randomVectorValues))
+            .totalLiveDocs(buildIndexParams.getTotalLiveDocs())
+            .segmentWriteState(segmentWriteState)
+            .isFlush(randomBoolean())
+            .build();
     }
 
     public Map<String, Object> getMockParameterMap() {

@@ -21,6 +21,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.query.rescore.RescoreContext;
 
 /**
  * Class to create radius nearest neighbor queries
@@ -68,20 +69,26 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final float[] vector = createQueryRequest.getVector();
 
         final Query innerQuery;
-        if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(createQueryRequest.getKnnEngine())) {
+        if (createQueryRequest.getKnnEngine().createsCustomSegmentFiles()) {
             innerQuery = createNativeEngineRadialQuery(createQueryRequest);
         } else {
             innerQuery = createLuceneRadialQuery(createQueryRequest);
         }
 
-        if (createQueryRequest.getVectorFieldType() != null && createQueryRequest.getVectorFieldType().isRescoringRequiredForRadial()) {
-            // Honor the index-level max_result_window setting to cap the number of results retained
-            // after rescoring. Falls back to MAX_RESULTS_RADIAL_RESCORING if context is unavailable.
-            final int maxResultsSize;
+        // SQ or BQ at 1, 2 or 4 bits requires rescoring after radial search to eliminate false positives.
+        if (createQueryRequest.getVectorFieldType() != null
+            && createQueryRequest.getVectorFieldType().getResolvedSpec().requiresFullPrecisionRadialRescore()) {
+            final Query sizeBoundedQuery = createSizeBoundedQuantizedRadialQuery(createQueryRequest);
+            if (sizeBoundedQuery != null) {
+                return sizeBoundedQuery;
+            }
+            // Honor the index-level max_result_window setting to cap the candidates rescored.
+            // Falls back to MAX_RESULTS_RADIAL_RESCORING if context is unavailable.
+            final int fallbackFirstPassK;
             if (createQueryRequest.getContext().isPresent()) {
-                maxResultsSize = createQueryRequest.getContext().get().getIndexSettings().getMaxResultWindow();
+                fallbackFirstPassK = createQueryRequest.getContext().get().getIndexSettings().getMaxResultWindow();
             } else {
-                maxResultsSize = MAX_RESULTS_RADIAL_RESCORING;
+                fallbackFirstPassK = MAX_RESULTS_RADIAL_RESCORING;
             }
             return new RescoreRadialSearchQuery(
                 innerQuery,
@@ -89,10 +96,63 @@ public class RNNQueryFactory extends BaseQueryFactory {
                 vector,
                 radius,
                 createQueryRequest.isMemoryOptimizedSearchEnabled(),
-                maxResultsSize
+                fallbackFirstPassK,
+                createQueryRequest.getSpaceType()
             );
         }
         return innerQuery;
+    }
+
+    /**
+     * Builds the size-bounded form of a quantized radial query: an oversampled top-k first pass of
+     * {@code ceil(size * oversample_factor)} candidates instead of an unbounded radial scan, then rescored
+     * against full-precision vectors. The cap scales with the oversample factor so a large size can still
+     * surface {@link RescoreContext#MAX_FIRST_PASS_RESULTS} hits.
+     *
+     * @param request the query creation request
+     * @return the size-bounded query, or {@code null} if the request size is unavailable
+     */
+    private static Query createSizeBoundedQuantizedRadialQuery(final CreateQueryRequest request) {
+        final Integer size = request.getSize();
+        if (size == null || size <= 0) {
+            return null;
+        }
+
+        final RescoreContext rescoreContext = request.getRescoreContext().orElse(RescoreContext.getDefault());
+        final float oversampleFactor = rescoreContext.getOversampleFactor();
+        final int firstPassK = (int) Math.min(
+            Math.ceil((double) RescoreContext.MAX_FIRST_PASS_RESULTS * oversampleFactor),
+            Math.ceil((double) size * oversampleFactor)
+        );
+
+        final Query approximateCandidates = KNNQueryFactory.create(
+            KNNQueryFactory.CreateQueryRequest.builder()
+                .knnEngine(request.getKnnEngine())
+                .indexName(request.getIndexName())
+                .fieldName(request.getFieldName())
+                .vector(request.getVector())
+                .originalVector(request.getOriginalVector())
+                .byteVector(request.getByteVector())
+                .vectorDataType(request.getVectorDataType())
+                .spaceType(request.getSpaceType())
+                .k(firstPassK)
+                .methodParameters(request.getMethodParameters())
+                .filter(request.getFilter().orElse(null))
+                .context(request.getContext().orElse(null))
+                .expandNested(request.isExpandNested())
+                .memoryOptimizedSearchEnabled(request.isMemoryOptimizedSearchEnabled())
+                .build()
+        );
+
+        return new RescoreRadialSearchQuery(
+            approximateCandidates,
+            request.getFieldName(),
+            request.getVector(),
+            request.getRadius(),
+            request.isMemoryOptimizedSearchEnabled(),
+            firstPassK,
+            request.getSpaceType()
+        );
     }
 
     /**
@@ -124,6 +184,7 @@ public class RNNQueryFactory extends BaseQueryFactory {
             .parentsFilter(parentFilter)
             .radius(request.getRadius())
             .vectorDataType(request.getVectorDataType())
+            .spaceType(request.getSpaceType())
             .methodParameters(request.getMethodParameters())
             .context(knnQueryContext)
             .isMemoryOptimizedSearch(request.isMemoryOptimizedSearchEnabled())
@@ -150,13 +211,20 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final Query filterQuery = getFilterQuery(request);
 
         log.debug(
-            String.format("Creating Lucene r-NN query for index: %s \"\", field: %s \"\", k: %f", request.getIndexName(), fieldName, radius)
+            String.format(
+                Locale.ROOT,
+                "Creating Lucene r-NN query for index: %s \"\", field: %s \"\", k: %f",
+                request.getIndexName(),
+                fieldName,
+                radius
+            )
         );
 
         switch (request.getVectorDataType()) {
             case BYTE:
                 return getByteVectorSimilarityQuery(fieldName, request.getByteVector(), radius, filterQuery);
             case FLOAT:
+            case HALF_FLOAT:
                 return getFloatVectorSimilarityQuery(fieldName, request.getVector(), radius, filterQuery);
             default:
                 throw new IllegalArgumentException(
@@ -181,7 +249,13 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final float resultSimilarity,
         final Query filterQuery
     ) {
-        return new FloatVectorSimilarityQuery(fieldName, floatVector, resultSimilarity, DEFAULT_LUCENE_RADIAL_SEARCH_DECAY, filterQuery);
+        return new FloatVectorSimilarityQuery.Adaptive(
+            fieldName,
+            floatVector,
+            resultSimilarity,
+            DEFAULT_LUCENE_RADIAL_SEARCH_DECAY,
+            filterQuery
+        );
     }
 
     /**
@@ -194,6 +268,12 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final float resultSimilarity,
         final Query filterQuery
     ) {
-        return new ByteVectorSimilarityQuery(fieldName, byteVector, resultSimilarity, DEFAULT_LUCENE_RADIAL_SEARCH_DECAY, filterQuery);
+        return new ByteVectorSimilarityQuery.Adaptive(
+            fieldName,
+            byteVector,
+            resultSimilarity,
+            DEFAULT_LUCENE_RADIAL_SEARCH_DECAY,
+            filterQuery
+        );
     }
 }

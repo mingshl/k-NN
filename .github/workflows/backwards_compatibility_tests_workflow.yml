@@ -32,11 +32,15 @@ on:
 jobs:
   Restart-Upgrade-BWCTests-k-NN:
     strategy:
+      # Let every bwc_version job run to completion, so one failing version does not mask results for
+      # the others across a parallel matrix.
+      fail-fast: false
       matrix:
         java: [ 21 ]
         os: [ubuntu-latest]
-        bwc_version : [ "2.0.1", "2.1.0", "2.2.1", "2.3.0", "2.4.1", "2.5.0", "2.6.0", "2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0", "2.12.0", "2.13.0", "2.14.0", "2.15.0", "2.16.0", "2.17.0", "2.18.0","2.19.1", "2.20.0-SNAPSHOT"]
-        opensearch_version : [ "3.8.0-SNAPSHOT" ]
+        # 3.x versions (3.0.0 - 3.8.0", "3.9.0) temporarily removed due to flaky BWC tests; re-add to restore 3.x -> current coverage.
+        bwc_version : [ "2.0.1", "2.1.0", "2.2.1", "2.3.0", "2.4.1", "2.5.0", "2.6.0", "2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0", "2.12.0", "2.13.0", "2.14.0", "2.15.0", "2.16.0", "2.17.0", "2.18.0","2.19.6", "2.20.0-SNAPSHOT"]
+        opensearch_version : [ "3.10.0-SNAPSHOT" ]
         exclude:
           - os: windows-latest
             bwc_version: "2.0.1"
@@ -67,7 +71,6 @@ jobs:
         with:
           java-version: ${{ matrix.java }}
           distribution: temurin
-          cache: gradle
 
       - if: startsWith(matrix.os,'ubuntu')
         name: Install dependencies on ubuntu
@@ -129,11 +132,14 @@ jobs:
 
   Rolling-Upgrade-BWCTests-k-NN:
     strategy:
+      # Let every bwc_version job run to completion, so one failing version does not mask results for
+      # the others across a parallel matrix.
+      fail-fast: false
       matrix:
         java: [ 21 ]
         os: [ubuntu-latest]
-        bwc_version: [ "2.20.0-SNAPSHOT" ]
-        opensearch_version: [ "3.8.0-SNAPSHOT" ]
+        bwc_version: [ "2.20.0-SNAPSHOT", "3.8.0", "3.9.0" ]
+        opensearch_version: [ "3.10.0-SNAPSHOT" ]
 
     name: k-NN Rolling-Upgrade BWC Tests
     runs-on: ${{ matrix.os }}
@@ -155,7 +161,6 @@ jobs:
         with:
           java-version: ${{ matrix.java }}
           distribution: temurin
-          cache: gradle
 
       - if: startsWith(matrix.os,'ubuntu')
         name: Install dependencies on ubuntu
@@ -201,7 +206,7 @@ jobs:
           if lscpu | grep -q "GenuineIntel" && lscpu | grep -i avx512_fp16 | grep -i avx512_bf16 | grep -i avx512_vpopcntdq
           then
             echo "the system is an Intel(R) Sapphire Rapids or a newer-generation processor"
-            ./gradlew :qa:rolling-upgrade:testRollingUpgrade -Dtests.bwc.version=$BWC_VERSION_RESTART_UPGRADE -Dnproc.count=`nproc` -Davx512_spr.enabled=true
+            ./gradlew :qa:rolling-upgrade:testRollingUpgrade -Dtests.bwc.version=$BWC_VERSION_ROLLING_UPGRADE -Dnproc.count=`nproc` -Davx512_spr.enabled=true
           else  
             echo "avx512 available on system"
             ./gradlew :qa:rolling-upgrade:testRollingUpgrade -Dtests.bwc.version=$BWC_VERSION_ROLLING_UPGRADE -Dnproc.count=`nproc` -Davx512_spr.enabled=false
