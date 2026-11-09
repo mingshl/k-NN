@@ -8,7 +8,9 @@ package org.opensearch.knn.memoryoptsearch.faiss;
 import lombok.Getter;
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.knn.memoryoptsearch.faiss.reconstruct.FaissQuantizerType;
 
 import java.io.IOException;
 
@@ -31,9 +33,12 @@ public class MMapFloatVectorValues extends FloatVectorValues implements MMapVect
     // addressAndSize[3] has the size of the second mapped region.
     @Getter
     private final long[] addressAndSize;
+    @Getter
     private final FloatVectorValues delegate;
+    @Getter
+    private final FaissQuantizerType quantizerType;
 
-    public MMapFloatVectorValues(final FloatVectorValues delegate, final long[] addressAndSize) {
+    public MMapFloatVectorValues(final FloatVectorValues delegate, final long[] addressAndSize, final FaissQuantizerType quantizerType) {
         this.delegate = delegate;
         if (addressAndSize == null || addressAndSize.length == 0) {
             throw new IllegalArgumentException(
@@ -44,6 +49,11 @@ public class MMapFloatVectorValues extends FloatVectorValues implements MMapVect
             );
         }
         this.addressAndSize = addressAndSize;
+        this.quantizerType = quantizerType;
+    }
+
+    public MMapFloatVectorValues(final FloatVectorValues delegate, final long[] addressAndSize) {
+        this(delegate, addressAndSize, null);
     }
 
     @Override
@@ -71,8 +81,23 @@ public class MMapFloatVectorValues extends FloatVectorValues implements MMapVect
     }
 
     @Override
+    public DocIndexIterator iterator() {
+        return delegate.iterator();
+    }
+
+    @Override
+    public int ordToDoc(int ord) {
+        return delegate.ordToDoc(ord);
+    }
+
+    @Override
+    public VectorScorer scorer(float[] target) throws IOException {
+        return delegate.scorer(target);
+    }
+
+    @Override
     public FloatVectorValues copy() throws IOException {
-        return new MMapFloatVectorValues(delegate.copy(), addressAndSize);
+        return new MMapFloatVectorValues(delegate.copy(), addressAndSize, quantizerType);
     }
 
     /**

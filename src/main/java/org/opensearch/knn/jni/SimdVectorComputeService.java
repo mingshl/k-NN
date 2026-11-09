@@ -18,16 +18,62 @@ public class SimdVectorComputeService {
 
     /**
      * Similarity calculation type to passed down to native code.
+     *
+     * <p>Each constant carries an explicit {@code wireValue}: the integer passed across the JNI boundary as the
+     * {@code nativeFunctionTypeOrd} parameter of the native methods. The native side ({@code NativeSimilarityFunctionType}
+     * in {@code similarity_function.h}) dispatches on these exact numbers, so they are part of the JNI wire contract:
+     * never renumber an existing constant, and assign any new constant the next unused number regardless of where it is
+     * declared. Use {@link #getWireValue()} instead of {@link #ordinal()}, which would silently change if constants were
+     * reordered or inserted.
      */
     public enum SimilarityFunctionType {
         // FP16 Maximum Inner Product. The result will be the same as we acquired from VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.
-        FP16_MAXIMUM_INNER_PRODUCT,
-        // FP16 Maximum Inner Product. The result will be the same as we acquired from VectorSimilarityFunction.EUCLIDEAN.
-        FP16_L2,
-        SQ_IP,
-        SQ_L2
+        FP16_MAXIMUM_INNER_PRODUCT(0),
+        // FP16 L2. The result will be the same as we acquired from VectorSimilarityFunction.EUCLIDEAN.
+        FP16_L2(1),
+        SQ_IP(2),
+        SQ_L2(3),
+        // BF16 Maximum Inner Product. The result will be the same as we acquired from VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.
+        BF16_MAXIMUM_INNER_PRODUCT(4),
+        // BF16 L2. The result will be the same as we acquired from VectorSimilarityFunction.EUCLIDEAN.
+        BF16_L2(5),
+        // FP16 Cosine. Vectors are guaranteed to be L2-normalized, so cosine = inner product with score = (1 + dot) / 2.
+        FP16_COSINE(6),
+        // SQ Cosine. Same IP math as SQ_IP but with cosine score transform.
+        SQ_COSINE(7);
+
+        private final int wireValue;
+
+        SimilarityFunctionType(final int wireValue) {
+            this.wireValue = wireValue;
+        }
+
+        /**
+         * Returns the stable integer identifying this similarity function on the native side.
+         *
+         * @return wire value expected by the native {@code nativeFunctionTypeOrd} parameters
+         */
+        public int getWireValue() {
+            return wireValue;
+        }
     }
 
+    /**
+     * Persists the scalar-quantized (SQ) query state for the native bulk SIMD scorer. Must be called prior to each search.
+     *
+     * @param quantizedQuery             Quantized 4-bit query: nibble transposed into 4 bit planes for 1- and 2-bit
+     *                                   documents, one code per dimension for 4-bit documents.
+     * @param queryLowerInterval         Query lower interval correction factor.
+     * @param queryUpperInterval         Query upper interval correction factor.
+     * @param queryAdditionalCorrection  Query additional correction factor.
+     * @param queryQuantizedComponentSum Query quantized component sum.
+     * @param addressAndSize             Address and size pairs of the mapped vector chunks.
+     * @param nativeFunctionTypeOrd      Similarity function type index.
+     * @param dimension                  Vector dimension.
+     * @param centroidDp                 Centroid dot-product correction.
+     * @param docBits                    Document code width: 1 (SINGLE_BIT_QUERY_NIBBLE), 2 (DIBIT_QUERY_NIBBLE) or
+     *                                   4 (PACKED_NIBBLE). Selects the record size and the code dot product.
+     */
     public static native void saveSQSearchContext(
         byte[] quantizedQuery,
         float queryLowerInterval,
@@ -37,7 +83,8 @@ public class SimdVectorComputeService {
         long[] addressAndSize,
         int nativeFunctionTypeOrd,
         int dimension,
-        float centroidDp
+        float centroidDp,
+        int docBits
     );
 
     /**
@@ -71,4 +118,25 @@ public class SimdVectorComputeService {
      * @return Similarity score.
      */
     public native static float scoreSimilarity(int internalVectorId);
+
+    /**
+     * Computes similarity between a query vector and one or more FP16-encoded vectors held
+     * directly in a Java byte[] (as opposed to a memory-mapped native chunk). This allows non-mmap
+     * scoring paths to still benefit from native SIMD FP16 distance computation when the CPU
+     * supports it.
+     *
+     * @param fp16Vectors            FP16-encoded vector bytes, `numVectors` vectors packed contiguously
+     *                               (2 * dimension bytes per vector, little-endian)
+     * @param numVectors             Number of vectors packed in `fp16Vectors`
+     * @param internalVectorIds      Positional ids of the packed vectors. Callers build this once and
+     *                               reuse/grow it across calls to avoid reallocating it on every native call.
+     * @param scores                 Output array to fill with `numVectors` similarity scores
+     * @return The maximum of the computed scores.
+     */
+    public native static float scoreSimilarityInBulkFromFp16Bytes(
+        byte[] fp16Vectors,
+        int numVectors,
+        int[] internalVectorIds,
+        float[] scores
+    );
 }

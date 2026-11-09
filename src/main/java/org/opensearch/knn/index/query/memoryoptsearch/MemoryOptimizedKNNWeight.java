@@ -9,11 +9,13 @@ import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.QueryTimeout;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
@@ -24,6 +26,7 @@ import org.apache.lucene.search.knn.TopKnnCollectorManager;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
+import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
@@ -52,29 +55,47 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
     private static final KnnSearchStrategy.Hnsw DEFAULT_HNSW_SEARCH_STRATEGY = new KnnSearchStrategy.Hnsw(0);
 
     private final KnnCollectorManager knnCollectorManager;
+    @Nullable
+    private final QueryTimeout queryTimeout;
     @Setter
     private ReentrantKnnCollectorManager reentrantKNNCollectorManager;
 
     public MemoryOptimizedKNNWeight(KNNQuery query, float boost, final Weight filterWeight, IndexSearcher searcher, Integer k) {
         super(query, boost, filterWeight);
+        this.queryTimeout = searcher.getTimeout();
 
         if (k != null && k > 0) {
             // ANN Search
             if (query.getParentsFilter() == null) {
                 // Non-nested case
-                this.knnCollectorManager = new OptimisticKnnCollectorManager(k, new TopKnnCollectorManager(k, searcher));
+                this.knnCollectorManager = new TimeLimitingKnnCollectorManager(
+                    new OptimisticKnnCollectorManager(k, new TopKnnCollectorManager(k, searcher)),
+                    queryTimeout
+                );
             } else {
                 // Nested case
-                this.knnCollectorManager = new DiversifyingNearestChildrenKnnCollectorManager(k, query.getParentsFilter(), searcher);
+                this.knnCollectorManager = new TimeLimitingKnnCollectorManager(
+                    new DiversifyingNearestChildrenKnnCollectorManager(k, query.getParentsFilter(), searcher),
+                    queryTimeout
+                );
             }
         } else {
             // Radius search: use Lucene 10.5's decay-based radial search with resultSimilarity = radius.
-            this.knnCollectorManager = (visitLimit, searchStrategy, context) -> new RadiusVectorSimilarityCollector(
-                query.getRadius(),
-                DEFAULT_LUCENE_RADIAL_SEARCH_DECAY,
-                visitLimit
+            this.knnCollectorManager = new TimeLimitingKnnCollectorManager(
+                (visitLimit, searchStrategy, context) -> new RadiusVectorSimilarityCollector(
+                    query.getRadius(),
+                    DEFAULT_LUCENE_RADIAL_SEARCH_DECAY,
+                    visitLimit
+                ),
+                queryTimeout
             );
         }
+    }
+
+    @Override
+    @Nullable
+    protected QueryTimeout getQueryTimeout() {
+        return queryTimeout;
     }
 
     @Override
@@ -106,7 +127,8 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                             filterIdsBitSet,
                             reader,
                             knnEngine,
-                            spaceType
+                            spaceType,
+                            false
                         );
                     }
 
@@ -130,12 +152,13 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                         filterIdsBitSet,
                         reader,
                         knnEngine,
-                        spaceType
+                        spaceType,
+                        false
                     );
                 }
 
                 if (adcTransformedVector != null) {
-                    // ADC case
+                    // ADC case: the scorer emits MaxIP-format scores, so cosine requires post-conversion.
                     return queryIndex(
                         adcTransformedVector,
                         cardinality,
@@ -144,7 +167,8 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                         filterIdsBitSet,
                         reader,
                         knnEngine,
-                        spaceType
+                        spaceType,
+                        true
                     );
                 }
 
@@ -157,11 +181,22 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                     filterIdsBitSet,
                     reader,
                     knnEngine,
-                    spaceType
+                    spaceType,
+                    false
                 );
             } else {
                 // Radius search
-                return queryIndex(knnQuery.getVector(), cardinality, cardinality, context, filterIdsBitSet, reader, knnEngine, spaceType);
+                return queryIndex(
+                    knnQuery.getVector(),
+                    cardinality,
+                    cardinality,
+                    context,
+                    filterIdsBitSet,
+                    reader,
+                    knnEngine,
+                    spaceType,
+                    false
+                );
             }
         } catch (Exception e) {
             GRAPH_QUERY_ERRORS.increment();
@@ -177,7 +212,8 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         final BitSet filterIdsBitSet,
         final SegmentReader reader,
         final KNNEngine knnEngine,
-        final SpaceType spaceType
+        final SpaceType spaceType,
+        final boolean isAdc
     ) throws IOException {
         assert (targetVector instanceof float[] || targetVector instanceof byte[]);
 
@@ -214,7 +250,12 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
             log.debug("[KNN] Query yielded 0 results");
             return EMPTY_TOPDOCS;
         }
-        if (spaceType == SpaceType.COSINESIMIL) {
+        // For the FP16 and SQ formats the scorer now emits cosine scores directly via
+        // VectorSimilarityFunction.COSINE (the FP16_COSINE / SQ_COSINE kernels apply the (1 + dot) / 2
+        // transform in-kernel), so no post-conversion is needed. The ADC (binary-quantized) path scores a
+        // float query against 1-bit vectors and still emits MaxIP-format scores, so it retains the
+        // MaxIP -> cosine post-conversion here.
+        if (isAdc && spaceType == SpaceType.COSINESIMIL) {
             MemoryOptimizedSearchScoreConverter.convertToCosineScore(topDocs.scoreDocs);
         }
         addExplainIfRequired(topDocs, knnEngine, spaceType);

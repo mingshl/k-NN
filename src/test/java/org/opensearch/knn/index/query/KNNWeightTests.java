@@ -9,9 +9,16 @@ import com.google.common.collect.Comparators;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import lombok.SneakyThrows;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.index.memory.MemoryIndex;
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfo;
@@ -96,6 +103,39 @@ import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 import static org.opensearch.knn.utils.TopDocsTestUtils.buildTopDocs;
 
 public class KNNWeightTests extends KNNWeightTestCase {
+    public void testSearchUsesWrappedFieldView() throws IOException {
+        final KNNQuery query = new KNNQuery(FIELD_NAME, QUERY_VECTOR, K, INDEX_NAME, null);
+        final KNNWeight knnWeight = new DefaultKNNWeight(query, 1.0f, null);
+        final LeafReaderContext leafReaderContext = mock(LeafReaderContext.class);
+        final SegmentReader segmentReader = mock(SegmentReader.class);
+        final FieldInfos underlyingFieldInfos = mock(FieldInfos.class);
+        when(segmentReader.getFieldInfos()).thenReturn(underlyingFieldInfos);
+        when(underlyingFieldInfos.fieldInfo(FIELD_NAME)).thenReturn(mock(FieldInfo.class));
+        final LeafReader filteredReader = new FilterLeafReader(segmentReader) {
+            @Override
+            public FieldInfos getFieldInfos() {
+                return new FieldInfos(new FieldInfo[0]);
+            }
+
+            @Override
+            public CacheHelper getCoreCacheHelper() {
+                return null;
+            }
+
+            @Override
+            public CacheHelper getReaderCacheHelper() {
+                return null;
+            }
+        };
+        when(leafReaderContext.reader()).thenReturn(filteredReader);
+
+        assertEquals(0, knnWeight.searchLeaf(leafReaderContext, K).getResult().scoreDocs.length);
+        assertEquals(0, knnWeight.approximateSearch(leafReaderContext, null, 0, K).scoreDocs.length);
+        assertEquals(0, knnWeight.exactSearch(leafReaderContext, mock(ExactSearcher.ExactSearcherContext.class)).scoreDocs.length);
+        assertFalse(knnWeight.explain(leafReaderContext, 0).isMatch());
+        assertFalse(knnWeight.explain(leafReaderContext, 0, 1.0f).isMatch());
+    }
+
     @SneakyThrows
     public void testQueryResultScoreNmslib() {
         for (SpaceType space : List.of(SpaceType.L2, SpaceType.L1, SpaceType.COSINESIMIL, SpaceType.INNER_PRODUCT, SpaceType.LINF)) {
@@ -254,7 +294,7 @@ public class KNNWeightTests extends KNNWeightTestCase {
         when(fieldInfo.getAttribute(eq(MODEL_ID))).thenReturn(modelId);
 
         RuntimeException ex = expectThrows(RuntimeException.class, () -> knnWeight.scorer(leafReaderContext));
-        assertEquals(String.format("Model \"%s\" is not created.", modelId), ex.getMessage());
+        assertEquals(String.format(Locale.ROOT, "Model \"%s\" is not created.", modelId), ex.getMessage());
     }
 
     @SneakyThrows
@@ -1726,7 +1766,7 @@ public class KNNWeightTests extends KNNWeightTestCase {
         String engineName = fieldInfo.attributes().getOrDefault(KNN_ENGINE, KNNEngine.NMSLIB.getName());
         KNNEngine knnEngine = KNNEngine.getEngine(engineName);
         List<String> engineFiles = KNNCodecUtil.getEngineFiles(knnEngine.getExtension(), query.getField(), reader.getSegmentInfo().info);
-        String expectIndexPath = String.format("%s_%s_%s%s%s", SEGMENT_NAME, 2011, FIELD_NAME, knnEngine.getExtension(), "c");
+        String expectIndexPath = String.format(Locale.ROOT, "%s_%s_%s%s%s", SEGMENT_NAME, 2011, FIELD_NAME, knnEngine.getExtension(), "c");
         assertEquals(engineFiles.get(0), expectIndexPath);
 
         final KNNScorer knnScorer = (KNNScorer) knnWeight.scorer(leafReaderContext);
@@ -1783,6 +1823,12 @@ public class KNNWeightTests extends KNNWeightTestCase {
             when(reader.getFieldInfos()).thenReturn(fieldInfos);
             when(fieldInfos.fieldInfo(any())).thenReturn(fieldInfo);
             when(fieldInfo.attributes()).thenReturn(attributesMap);
+            // The segment carries the quantized vector field with live vectors, so SegmentLevelQuantizationInfo.build
+            // proceeds past its field-is-vector / non-empty-segment guards to load the quantization state.
+            when(fieldInfo.hasVectorValues()).thenReturn(true);
+            final FloatVectorValues floatVectorValues = mock(FloatVectorValues.class);
+            when(floatVectorValues.size()).thenReturn(1);
+            when(reader.getFloatVectorValues(FIELD_NAME)).thenReturn(floatVectorValues);
             // fieldName, new float[0], tempCollector, null)
             doNothing().when(reader).searchNearestVectors(any(), eq(new float[0]), any(), any());
 
@@ -1885,5 +1931,79 @@ public class KNNWeightTests extends KNNWeightTestCase {
                 );
             }
         }
+    }
+
+    /**
+     * Percolation evaluates stored queries against a Lucene {@code MemoryIndex}, which has no segment behind
+     * it. Such a leaf carries no native engine files, so the only thing that can score it is exact search.
+     */
+    @SneakyThrows
+    public void testSearchLeaf_whenLeafHasNoSegment_thenExactSearch() {
+        KNNWeight.initialize(null);
+        final LeafReaderContext leafReaderContext = memoryIndexLeaf(new float[] { 1.0f, 2.0f });
+        final KNNQuery query = segmentLessQuery(SpaceType.L2);
+
+        final PerLeafResult result = new DefaultKNNWeight(query, 1.0f, null).searchLeaf(leafReaderContext, 3);
+
+        assertEquals(PerLeafResult.SearchMode.EXACT_SEARCH, result.getSearchMode());
+        assertEquals(1, result.getResult().scoreDocs.length);
+        // Squared L2 distance between [1, 2] and [3, 4] is 8, so 1 / (1 + 8).
+        assertEquals(0.111111f, result.getResult().scoreDocs[0].score, 1e-5f);
+    }
+
+    /**
+     * A {@code MemoryIndex} leaf exposes no field attributes, so the space type can only be recovered from the
+     * Lucene similarity function recorded on the field. That disagrees with the mapping for any space type
+     * Lucene has no equivalent for, so the query carries the mapped value and it has to win.
+     */
+    @SneakyThrows
+    public void testSearchLeaf_whenLeafHasNoSegment_thenQuerySpaceTypeWinsOverFieldInfo() {
+        KNNWeight.initialize(null);
+        final LeafReaderContext leafReaderContext = memoryIndexLeaf(new float[] { 1.0f, 2.0f });
+
+        final PerLeafResult withSpaceType = new DefaultKNNWeight(segmentLessQuery(SpaceType.INNER_PRODUCT), 1.0f, null).searchLeaf(
+            leafReaderContext,
+            3
+        );
+        // Inner product of [1, 2] and [3, 4] is 11, so 11 + 1.
+        assertEquals(12.0f, withSpaceType.getResult().scoreDocs[0].score, 1e-5f);
+
+        // Without one, the field is scored with the EUCLIDEAN function it was indexed with.
+        final PerLeafResult withoutSpaceType = new DefaultKNNWeight(segmentLessQuery(null), 1.0f, null).searchLeaf(leafReaderContext, 3);
+        assertEquals(0.111111f, withoutSpaceType.getResult().scoreDocs[0].score, 1e-5f);
+    }
+
+    /**
+     * Explain resolves the space type the same way scoring does, so a leaf with no field attributes has to
+     * report the mapped space type and not the L2 the recorded similarity function would give.
+     */
+    @SneakyThrows
+    public void testExplain_whenLeafHasNoSegment_thenReportsQuerySpaceType() {
+        KNNWeight.initialize(null);
+        final LeafReaderContext leafReaderContext = memoryIndexLeaf(new float[] { 1.0f, 2.0f });
+        final KNNWeight knnWeight = new DefaultKNNWeight(segmentLessQuery(SpaceType.INNER_PRODUCT), 1.0f, null);
+
+        final Explanation explanation = knnWeight.explain(leafReaderContext, 0, 12.0f);
+
+        final String rendered = explanation.toString();
+        assertTrue(rendered, rendered.contains("spaceType = " + SpaceType.INNER_PRODUCT.getValue()));
+        assertFalse(rendered, rendered.contains("spaceType = " + SpaceType.L2.getValue()));
+    }
+
+    private LeafReaderContext memoryIndexLeaf(final float[] vector) {
+        final MemoryIndex memoryIndex = new MemoryIndex(true, true);
+        memoryIndex.addField(new KnnFloatVectorField(FIELD_NAME, vector, VectorSimilarityFunction.EUCLIDEAN), null);
+        return memoryIndex.createSearcher().getIndexReader().leaves().get(0);
+    }
+
+    private KNNQuery segmentLessQuery(final SpaceType spaceType) {
+        return KNNQuery.builder()
+            .field(FIELD_NAME)
+            .queryVector(new float[] { 3.0f, 4.0f })
+            .k(3)
+            .indexName(INDEX_NAME)
+            .vectorDataType(VectorDataType.FLOAT)
+            .spaceType(spaceType)
+            .build();
     }
 }

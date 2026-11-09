@@ -1,0 +1,380 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.knn.index.engine;
+
+import lombok.Builder;
+import lombok.Getter;
+import org.opensearch.Version;
+import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.mapper.CompressionLevel;
+import org.opensearch.knn.index.mapper.Mode;
+import org.opensearch.knn.index.query.rescore.RescoreContext;
+
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_BF16;
+import static org.opensearch.knn.common.KNNConstants.METHOD_FLAT;
+import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
+import static org.opensearch.knn.common.KNNConstants.METHOD_IVF;
+
+/**
+ * Immutable value object holding resolved index configuration.
+ * Constructed once at resolution time, read by both write and query paths.
+ * All behavioral decisions are methods derived from stored primitives.
+ */
+@Builder(toBuilder = true)
+@Getter
+public final class ResolvedIndexSpec {
+    private final KNNEngine engine;
+    private final String methodName;
+    private final Encoder.EncoderType encoderType;
+    private final Encoder.QuantizationBits quantizationBits;
+    /**
+     * The Faiss SQ encoder subtype ({@code fp16}/{@code bf16}) captured from the {@code type} encoder param when
+     * {@code encoderType == SQ}. Null for non-SQ encoders and for the pre-3.6.0 legacy path with no explicit type
+     * (which is fp16 by convention). Used to distinguish bf16 from fp16, since both resolve to SQ with bits=16.
+     */
+    private final String sqType;
+    @Builder.Default
+    private final CompressionLevel compressionLevel = CompressionLevel.NOT_CONFIGURED;
+    @Builder.Default
+    private final Mode mode = Mode.NOT_CONFIGURED;
+    private final VectorDataType vectorDataType;
+    private final int dimension;
+    private final Version indexVersionCreated;
+    /**
+     * Whether this spec was resolved from model metadata rather than an explicit method mapping.
+     * Retained as provenance only; it no longer changes any behavior on this class.
+     */
+    @Builder.Default
+    private final boolean modelBased = false;
+    /**
+     * Method-level behavioral overrides, unset (null) on every core resolution path so built-in behavior is
+     * unchanged. A runtime-registered engine whose method builds its own spec sets them to contribute the
+     * behavior this class otherwise derives from core method and encoder constants: a non-null
+     * {@code rescoreDefaultOverride} is returned by {@link #getRescoreContext()} as the method's default
+     * rescore, and a non-null {@code memoryOptimizedEligibleOverride} answers
+     * {@link #isMemoryOptimizedEligible()}.
+     */
+    private final RescoreContext rescoreDefaultOverride;
+    private final Boolean memoryOptimizedEligibleOverride;
+
+    /**
+     * Creates a spec for a field with no ANN structure: flat (index.knn=false) fields and
+     * model fields whose metadata predates method serialization. All behavioral methods
+     * return "off" answers — no radial search, no default rescore, no memory-optimized search,
+     * no remote index build.
+     *
+     * @param vectorDataType data type of the vector field
+     * @param dimension dimension of the vector field
+     * @param indexVersionCreated version the index was created on
+     * @return a spec representing "no ANN configuration"
+     */
+    public static ResolvedIndexSpec noAnn(VectorDataType vectorDataType, int dimension, Version indexVersionCreated) {
+        return ResolvedIndexSpec.builder()
+            .vectorDataType(vectorDataType)
+            .dimension(dimension)
+            .indexVersionCreated(indexVersionCreated)
+            .build();
+    }
+
+    /**
+     * Creates a spec for a model field whose metadata predates method serialization.
+     * Same behavioral defaults as {@link #noAnn} but retains the model engine and marks
+     * the spec as model-based for radial search gating.
+     */
+    public static ResolvedIndexSpec noAnnFromModel(
+        KNNEngine engine,
+        VectorDataType vectorDataType,
+        int dimension,
+        Version indexVersionCreated
+    ) {
+        return ResolvedIndexSpec.builder()
+            .engine(engine)
+            .vectorDataType(vectorDataType)
+            .dimension(dimension)
+            .indexVersionCreated(indexVersionCreated)
+            .modelBased(true)
+            .build();
+    }
+
+    /**
+     * Returns a copy of this spec marked as model-derived.
+     * Used when a fully resolved spec (from method resolution) needs the model-based
+     * flag for radial search gating in {@link #supportsRadialSearch()}.
+     */
+    public ResolvedIndexSpec asModelBased() {
+        return toBuilder().modelBased(true).build();
+    }
+
+    /**
+     * Whether this configuration always uses memory optimized search.
+     * Multi-bit SQ indices (bits ∈ {1, 2, 4}) require memory optimized search for correctness,
+     * regardless of engine — document vectors are stored as integer-coded scalar-quantization
+     * codes in Lucene's flat SQ files, and only the memory-optimized reader knows how to
+     * score against those codes. The one exclusion is IVF: IVF-based SQ 1-bit models
+     * (e.g. trained with on_disk/32x) produce IVF Faiss indices that the memory optimized
+     * reader cannot load, so forcing memory optimized search for them would fail at query
+     * time. Multi-bit SQ + IVF is not a supported combination, so the same exclusion is safe
+     * for bits=2 and bits=4.
+     */
+    public boolean alwaysUseMemoryOptimizedSearch() {
+        return isSQMultiBit() && METHOD_IVF.equals(methodName) == false;
+    }
+
+    /**
+     * Whether this configuration is eligible for memory optimized search.
+     * Faiss HNSW with FLAT, SQ, or BQ encoders.
+     */
+    public boolean isMemoryOptimizedEligible() {
+        if (memoryOptimizedEligibleOverride != null) {
+            return memoryOptimizedEligibleOverride;
+        }
+        return engine == KNNEngine.FAISS
+            && METHOD_HNSW.equals(methodName)
+            && (encoderType == Encoder.EncoderType.FLAT || encoderType == Encoder.EncoderType.SQ || encoderType == Encoder.EncoderType.BQ);
+    }
+
+    /**
+     * Whether this configuration supports radial search. Blocked for engines that do not support it
+     * (NMSLIB), binary vectors, and quantized indices other than those handled by
+     * {@link #requiresFullPrecisionRadialRescore()}.
+     */
+    public boolean supportsRadialSearch() {
+        if (engine == null || engine.supportsRadialSearch() == false) {
+            return false;
+        }
+        if (vectorDataType == VectorDataType.BINARY) {
+            return false;
+        }
+        // Quantized indices not served by the rescoring path remain blocked.
+        if (isQuantizedIndex() && requiresFullPrecisionRadialRescore() == false) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether this configuration requires memory-optimized search regardless of cluster setting.
+     * True for ON_DISK mode with x1 (no) compression — these indices store vectors on disk and
+     * need memory-optimized search for acceptable latency.
+     */
+    public boolean requiresMemoryOptimizedSearchForOnDisk() {
+        return mode == Mode.ON_DISK && compressionLevel == CompressionLevel.x1;
+    }
+
+    private static final float FLAT_OVERSAMPLE_FACTOR = 2.0f;
+
+    /**
+     * Returns the default rescore context for this configuration, or null when no rescoring applies.
+     *
+     * <p>Resolution order:</p>
+     * <ol>
+     *   <li>SQ multi-bit (bits ∈ {1, 2, 4}): fixed oversample, overrides disallowed.
+     *       bits=1 (x32) uses the Faiss scalar-quantized factor; bits=2 (x16) and bits=4 (x8) use
+     *       {@link RescoreContext#SQ_MULTI_BIT_DEFAULT_OVERSAMPLE_FACTOR} — the higher-bit codes
+     *       recover most recall on their own.</li>
+     *   <li>x32 compression with the flat method: 2x oversample</li>
+     *   <li>Otherwise, only when the compression level requires rescoring for the resolved mode
+     *       ({@link CompressionLevel#isModeValidForRescore}):
+     *     <ul>
+     *       <li>x32 + Lucene engine on indices created on/after 3.6: Lucene scalar quantizer default</li>
+     *       <li>x4 on indices created before 3.1: no rescoring (BWC)</li>
+     *       <li>dimension at or below {@link RescoreContext#DIMENSION_THRESHOLD} (except x4): 5x oversample</li>
+     *       <li>otherwise the compression level own default</li>
+     *     </ul>
+     *   </li>
+     *   <li>All other configurations: null (no default rescore)</li>
+     * </ol>
+     *
+     * <p>Recomputed on each call since {@link RescoreContext} carries mutable state in
+     * {@code getFirstPassK()}.</p>
+     */
+    public RescoreContext getRescoreContext() {
+        if (rescoreDefaultOverride != null) {
+            return rescoreDefaultOverride;
+        }
+        if (isSQMultiBit()) {
+            final float oversampleFactor = quantizationBits == Encoder.QuantizationBits.ONE
+                ? RescoreContext.FAISS_SCALAR_QUANTIZED_INDEX_OVERSAMPLE_FACTOR
+                : RescoreContext.SQ_MULTI_BIT_DEFAULT_OVERSAMPLE_FACTOR;
+            return RescoreContext.builder()
+                .oversampleFactor(oversampleFactor)
+                .allowOverrideOversampleFactor(false)
+                .userProvided(false)
+                .build();
+        }
+
+        if (isMethodFlat()) {
+            Encoder.QuantizationBits flatBits = Encoder.QuantizationBits.fromCompressionLevel(compressionLevel, vectorDataType);
+            if (flatBits == Encoder.QuantizationBits.ONE) {
+                return RescoreContext.builder().oversampleFactor(FLAT_OVERSAMPLE_FACTOR).userProvided(false).build();
+            }
+            if (flatBits == Encoder.QuantizationBits.TWO || flatBits == Encoder.QuantizationBits.FOUR) {
+                return RescoreContext.builder()
+                    .oversampleFactor(RescoreContext.SQ_MULTI_BIT_DEFAULT_OVERSAMPLE_FACTOR)
+                    .userProvided(false)
+                    .build();
+            }
+        }
+
+        if (compressionLevel.isModeValidForRescore(mode)) {
+            Version version = indexVersionCreated != null ? indexVersionCreated : Version.CURRENT;
+
+            if (compressionLevel == CompressionLevel.x32 && engine == KNNEngine.LUCENE && version.onOrAfter(Version.V_3_6_0)) {
+                return RescoreContext.builder()
+                    .oversampleFactor(RescoreContext.OVERSAMPLE_FACTOR_DEFAULT_FOR_LUCENE_SCALAR_QUANTIZER_AFTER_V360)
+                    .userProvided(false)
+                    .build();
+            }
+
+            if (compressionLevel == CompressionLevel.x4 && version.before(Version.V_3_1_0)) {
+                return null;
+            }
+
+            if (compressionLevel != CompressionLevel.x4 && dimension <= RescoreContext.DIMENSION_THRESHOLD) {
+                return RescoreContext.builder()
+                    .oversampleFactor(RescoreContext.OVERSAMPLE_FACTOR_BELOW_DIMENSION_THRESHOLD)
+                    .userProvided(false)
+                    .build();
+            }
+
+            return compressionLevel.getDefaultRescoreContext();
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether rescoring is needed for this configuration.
+     */
+    public boolean requiresRescore() {
+        return getRescoreContext() != null;
+    }
+
+    /**
+     * Whether this is an SQ encoder producing fp16 quantized output. Distinct from native halfFloat data type storage.
+     * Equivalent to FaissHNSWMethod.isFloat16Index:
+     * encoder is SQ, dataType is FLOAT, and bits is SIXTEEN or legacy (null/FULL_PRECISION defaults to fp16).
+     */
+    public boolean isFP16QuantizedIndex() {
+        // FULL_PRECISION represents the legacy path where SQ encoder is specified without explicit bits param.
+        // buildResolvedIndexSpec defaults to FULL_PRECISION in this case, and the old FaissHNSWMethod.isFloat16Index()
+        // treated SQ-with-no-bits as fp16 by convention.
+        return vectorDataType == VectorDataType.FLOAT
+            && encoderType == Encoder.EncoderType.SQ
+            && (quantizationBits == Encoder.QuantizationBits.SIXTEEN || quantizationBits == Encoder.QuantizationBits.FULL_PRECISION);
+    }
+
+    /**
+     * Whether this is an SQ encoder producing bf16 quantized output. Like {@link #isFP16QuantizedIndex()} this
+     * resolves to SQ with bits=16, but the {@code type} encoder param is {@code bf16} rather than {@code fp16}.
+     */
+    public boolean isBF16QuantizedIndex() {
+        return vectorDataType == VectorDataType.FLOAT && encoderType == Encoder.EncoderType.SQ && FAISS_SQ_ENCODER_BF16.equals(sqType);
+    }
+
+    /**
+     * Whether this configuration supports remote index build.
+     *
+     * <p>Remote build requires the Faiss engine and the HNSW method. Within that, the following
+     * configurations are supported (mirroring what the remote build service can build):</p>
+     * <ul>
+     *   <li>SQ 1-bit (binary quantization via scalar quantizer)</li>
+     *   <li>FP16 (SQ encoder with bits=16)</li>
+     *   <li>FLOAT with FLAT encoder (full precision float32)</li>
+     *   <li>BINARY with FLAT encoder (user-provided binary vectors)</li>
+     *   <li>BYTE with FLAT encoder</li>
+     *   <li>HALF_FLOAT with FLAT encoder (native fp16 storage)</li>
+     *   <li>FLOAT with SQ encoder at intermediate bit widths (2, 4, 7 bits)</li>
+     *   <li>HALF_FLOAT with SQ encoder at intermediate bit widths (2, 4 bits)</li>
+     * </ul>
+     *
+     * <p>Everything else returns false — e.g. the PQ encoder and non-FLAT binary/byte configs. New
+     * encoder types and data types must be validated against the remote build service before being
+     * added here.</p>
+     */
+    public boolean supportsRemoteIndexBuild() {
+        if (engine != KNNEngine.FAISS || !METHOD_HNSW.equals(methodName)) {
+            return false;
+        }
+
+        // Block bf16 remote index build: the remote builder uses fp16 (half_float) as its build-time data type, so a
+        // bf16 vector with a value outside the fp16 range (bf16 shares float32's exponent range) would be silently
+        // truncated into a graph that is hard to debug. Keep bf16 on the local build path until the remote builder
+        // natively supports bf16. Checked before isFP16QuantizedIndex(), which also matches bf16 (SQ + bits=16).
+        if (isBF16QuantizedIndex()) {
+            return false;
+        }
+
+        if (isSQMultiBit() || isFP16QuantizedIndex()) {
+            return true;
+        }
+
+        if (encoderType == Encoder.EncoderType.FLAT) {
+            return vectorDataType == VectorDataType.FLOAT
+                || vectorDataType == VectorDataType.BINARY
+                || vectorDataType == VectorDataType.BYTE
+                || vectorDataType == VectorDataType.HALF_FLOAT;
+        }
+
+        return false;
+    }
+
+    public boolean isSQOneBit() {
+        return encoderType == Encoder.EncoderType.SQ && quantizationBits == Encoder.QuantizationBits.ONE;
+    }
+
+    /**
+     * True when the encoder is SQ configured for the memory-optimized multi-bit path
+     * (bits ∈ {1, 2, 4}). Document vectors are stored as integer-coded scalar-quantization
+     * codes in Lucene's flat SQ files; Faiss only builds the HNSW graph.
+     */
+    public boolean isSQMultiBit() {
+        return encoderType == Encoder.EncoderType.SQ
+            && (quantizationBits == Encoder.QuantizationBits.ONE
+                || quantizationBits == Encoder.QuantizationBits.TWO
+                || quantizationBits == Encoder.QuantizationBits.FOUR);
+    }
+
+    /**
+     * Whether radial search on this configuration is served by the size-bounded rescoring path in
+     * {@link org.opensearch.knn.index.query.RNNQueryFactory}. True for SQ and BQ at 1, 2 or 4 bits,
+     * where quantization error admits false positives inside the radius so candidates must be rescored
+     * against full-precision vectors.
+     *
+     * @see <a href="https://github.com/opensearch-project/k-NN/issues/3452">#3452</a>
+     */
+    public boolean requiresFullPrecisionRadialRescore() {
+        if (isSQMultiBit()) {
+            return true;
+        }
+        return encoderType == Encoder.EncoderType.BQ
+            && (quantizationBits == Encoder.QuantizationBits.ONE
+                || quantizationBits == Encoder.QuantizationBits.TWO
+                || quantizationBits == Encoder.QuantizationBits.FOUR);
+    }
+
+    public boolean isFaissSQOneBit() {
+        return engine == KNNEngine.FAISS && isSQOneBit();
+    }
+
+    public boolean isFaissSQMultiBit() {
+        return engine == KNNEngine.FAISS && isSQMultiBit();
+    }
+
+    private boolean isMethodFlat() {
+        return METHOD_FLAT.equals(methodName);
+    }
+
+    /**
+     * Returns true when the configured compression level implies lossy quantization that needs special handling.
+     * x1 is full precision and x2 is fp16 (near-lossless), so both are excluded; x4 and above are lossy.
+     */
+    private boolean isQuantizedIndex() {
+        return CompressionLevel.isConfigured(compressionLevel)
+            && compressionLevel != CompressionLevel.x1
+            && compressionLevel != CompressionLevel.x2;
+    }
+}

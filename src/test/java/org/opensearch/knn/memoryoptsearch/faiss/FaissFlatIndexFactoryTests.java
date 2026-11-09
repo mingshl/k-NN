@@ -6,6 +6,8 @@
 package org.opensearch.knn.memoryoptsearch.faiss;
 
 import lombok.SneakyThrows;
+import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.common.KNNConstants;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.index.FieldInfo;
 import org.opensearch.knn.KNNTestCase;
@@ -31,6 +33,39 @@ public class FaissFlatIndexFactoryTests extends KNNTestCase {
 
         assertNotNull(result);
         assertTrue(result instanceof FaissScalarQuantizedFlatIndex);
+    }
+
+    @SneakyThrows
+    public void testCreate_whenSQTwoBitField_thenReturnsFaissScalarQuantizedFlatIndex() {
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field").addAttribute(SQ_CONFIG, "bits=2").build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        FaissBinaryIndex result = FaissFlatIndexFactory.createBinaryIndex(fieldInfo, mockReader);
+
+        assertNotNull(result);
+        assertTrue(result instanceof FaissScalarQuantizedFlatIndex);
+    }
+
+    @SneakyThrows
+    public void testCreate_whenSQFourBitField_thenReturnsFaissScalarQuantizedFlatIndex() {
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field").addAttribute(SQ_CONFIG, "bits=4").build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        FaissBinaryIndex result = FaissFlatIndexFactory.createBinaryIndex(fieldInfo, mockReader);
+
+        assertNotNull(result);
+        assertTrue(result instanceof FaissScalarQuantizedFlatIndex);
+    }
+
+    @SneakyThrows
+    public void testCreate_whenSQFP16Field_thenReturnsNull() {
+        // bits=16 is fp16 (not an MOS width); the flat proxy should not be wired.
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field").addAttribute(SQ_CONFIG, "bits=16").build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        FaissBinaryIndex result = FaissFlatIndexFactory.createBinaryIndex(fieldInfo, mockReader);
+
+        assertNull(result);
     }
 
     @SneakyThrows
@@ -210,5 +245,60 @@ public class FaissFlatIndexFactoryTests extends KNNTestCase {
         } catch (IllegalStateException e) {
             assertTrue(e.getMessage().contains("CAGRA"));
         }
+    }
+
+    @SneakyThrows
+    public void testCreate_whenHalfFloatField_thenReturnsNull() {
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field")
+            .addAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.HALF_FLOAT.getValue())
+            .build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        assertNull(FaissFlatIndexFactory.createFlatIndex(fieldInfo, mockReader));
+    }
+
+    @SneakyThrows
+    public void testCreate_whenFloatField_thenReturnsNull() {
+        // FLOAT keeps its native flat storage, so there is nothing to reconstruct.
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field")
+            .addAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.FLOAT.getValue())
+            .build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        assertNull(FaissFlatIndexFactory.createFlatIndex(fieldInfo, mockReader));
+    }
+
+    @SneakyThrows
+    public void testCreate_whenSQOneBitAndHalfFloat_thenSQOneBitWins() {
+        // The sq,1-bit branch is checked first: a half_float sq,1-bit field must still reconstruct via
+        // FaissScalarQuantizedFlatIndex, not the half-float flat index.
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field")
+            .addAttribute(SQ_CONFIG, "bits=1")
+            .addAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.HALF_FLOAT.getValue())
+            .build();
+        FlatVectorsReader mockReader = mock(FlatVectorsReader.class);
+
+        FaissIndex result = FaissFlatIndexFactory.createFlatIndex(fieldInfo, mockReader);
+
+        assertTrue(result instanceof FaissScalarQuantizedFlatIndex);
+    }
+
+    @SneakyThrows
+    public void testCreate_whenByteField_thenReturnsNull() {
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field")
+            .addAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.BYTE.getValue())
+            .build();
+        assertNull(FaissFlatIndexFactory.createFlatIndex(fieldInfo, mock(FlatVectorsReader.class)));
+    }
+
+    @SneakyThrows
+    public void testCreate_whenSqSixteenBitFloatField_thenReturnsNull() {
+        // Regression guard: FLOAT + sq,16 is the fp16-for-faiss dedup case, deliberately out of scope.
+        // It must not be mistaken for half-float flat storage.
+        FieldInfo fieldInfo = KNNCodecTestUtil.FieldInfoBuilder.builder("test_field")
+            .addAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.FLOAT.getValue())
+            .addAttribute(SQ_CONFIG, "bits=16")
+            .build();
+        assertNull(FaissFlatIndexFactory.createFlatIndex(fieldInfo, mock(FlatVectorsReader.class)));
     }
 }

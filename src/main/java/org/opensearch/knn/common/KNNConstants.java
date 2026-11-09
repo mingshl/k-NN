@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.common;
 
+import org.opensearch.Version;
 import org.opensearch.knn.index.VectorDataType;
 
 import java.util.List;
@@ -84,6 +85,7 @@ public class KNNConstants {
     public static final String MINIMAL_MODE_AND_COMPRESSION_FEATURE = "mode_and_compression_feature";
     public static final String TOP_LEVEL_SPACE_TYPE_FEATURE = "top_level_space_type_feature";
     public static final String TOP_LEVEL_ENGINE_FEATURE = "top_level_engine_feature";
+    public static final String GENERIC_METHOD_PARAMETERS_FEATURE = "generic_method_parameters_feature";
 
     public static final String RADIAL_SEARCH_KEY = "radial_search";
     public static final int MAX_RESULTS_RADIAL_RESCORING = 10000;
@@ -122,6 +124,7 @@ public class KNNConstants {
 
     // Faiss specific constants
     public static final String FAISS_NAME = "faiss";
+    public static final String UNDEFINED_ENGINE_NAME = "undefined";
     public final static String FAISS_EXTENSION = ".faiss";
     public static final String INDEX_DESCRIPTION_PARAMETER = "index_description";
     public static final String METHOD_ENCODER_PARAMETER = "encoder";
@@ -140,7 +143,8 @@ public class KNNConstants {
     public static final String FAISS_SQ_DESCRIPTION = "SQ";
     public static final String FAISS_SQ_TYPE = "type";
     public static final String FAISS_SQ_ENCODER_FP16 = "fp16";
-    public static final List<String> FAISS_SQ_ENCODER_TYPES = List.of(FAISS_SQ_ENCODER_FP16);
+    public static final String FAISS_SQ_ENCODER_BF16 = "bf16";
+    public static final List<String> FAISS_SQ_ENCODER_TYPES = List.of(FAISS_SQ_ENCODER_FP16, FAISS_SQ_ENCODER_BF16);
     public static final String FAISS_SIGNED_BYTE_SQ = "SQ8_direct_signed";
     public static final String FAISS_SQ_CLIP = "clip";
 
@@ -196,6 +200,8 @@ public class KNNConstants {
 
     public static final String MODE_PARAMETER = "mode";
     public static final String COMPRESSION_LEVEL_PARAMETER = "compression_level";
+    // Version at which the default compression level flips to x32 and the 'mode' parameter is deprecated.
+    public static final Version KNN_DEFAULT_COMPRESSION_FLIP_VERSION = Version.V_3_8_0;
 
     // Repository filepath constants
     public static final String VECTOR_BLOB_FILE_EXTENSION = ".knnvec";
@@ -225,4 +231,15 @@ public class KNNConstants {
     public static final int BYTE_ALIGNMENT_MASK = 7; // Used for rounding up to nearest byte (Byte.SIZE - 1)
     // Define here: https://github.com/opensearch-project/remote-vector-index-builder/blob/main/API.md#index-parameters
     public static final int MIN_DOCS_FOR_REMOTE_INDEX_BUILD = 4;
+
+    // Version gate for rejecting user-supplied engine on method=flat mappings. Indices created
+    // before this version may have engine=lucene persisted in their flat mapping — they must
+    // continue to load without error. New indices reject any engine setting on flat.
+    public static final Version FLAT_METHOD_ENGINE_AGNOSTIC_VERSION = Version.V_3_9_0;
+    public static final int MIN_DIMENSIONS_FOR_REMOTE_INDEX_BUILD = 64;
+
+    // Version gate for accepting SQ 2-bit / 4-bit (x16 / x8) on the Lucene HNSW method. Indices
+    // created before this version only support SQ 1-bit (x32) and 7-bit (x4) on Lucene HNSW.
+    // 1-bit was introduced in 3.6.0 and stays gated there; 2/4-bit require the newer version.
+    public static final Version LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION = Version.V_3_9_0;
 }

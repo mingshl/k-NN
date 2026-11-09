@@ -1,3 +1,8 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -7,11 +12,14 @@
 #include "parameter_utils.h"
 #include "platform_defs.h"
 #include "simd/similarity_function/similarity_function.h"
+#include "simd/similarity_function/sq_format.h"
 #include "faiss/impl/ScalarQuantizer.h"
 #include "jni_util.h"
 
 using knn_jni::simd::similarity_function::SimdVectorSearchContext;
 using knn_jni::simd::similarity_function::SimilarityFunction;
+using knn_jni::simd::similarity_function::luceneSqCodeBytes;
+using knn_jni::simd::similarity_function::luceneSqQueryBytes;
 
 // Since Windows CI is failing to recognize std::aligned_malloc, it will make CI pass with macro.
 #if defined(_WIN32)
@@ -56,6 +64,17 @@ void SimdVectorSearchContext::getVectorPointersInBulk(uint8_t* vectors[], int32_
 
     // There are multiple mapped regions.
     if (mmapPages.empty() == false) {
+        // A vector that straddles two mmap regions is reassembled by getVectorPointer() into
+        // tmpBuffer via tmpBuffer.resize(), which may reallocate the underlying storage. If two
+        // (or more) vectors in this same batch straddle, the second resize() would reallocate and
+        // dangle the pointer we already stored in vectors[] for the earlier straddling vector,
+        // making the kernel read freed/moved memory. Pre-reserve the worst-case headroom for the
+        // whole batch up front (every vector reassembled needs at most oneVectorByteSize bytes plus
+        // one padding byte for even-address alignment) so no resize() inside the loop can reallocate,
+        // keeping every pointer returned in this call stable. reserve() preserves existing contents,
+        // so the query-correction prefix some kernels keep at the front of tmpBuffer is untouched.
+        tmpBuffer.reserve(tmpBuffer.size() + static_cast<size_t>(numVectors) * (static_cast<size_t>(oneVectorByteSize) + 1));
+
         for (int32_t i = 0 ; i < numVectors ; ++i) {
             vectors[i] = getVectorPointer(internalVectorIds[i]);
         }
@@ -172,7 +191,23 @@ SimdVectorSearchContext* SimilarityFunction::saveSearchContext(
            int32_t dimension,
            int64_t* mmapAddressAndSize,
            int32_t numAddressAndSize,
-           int32_t nativeFunctionTypeOrd) {
+           int32_t nativeFunctionTypeOrd,
+           int32_t docBits) {
+    // SQ: the kernels read luceneSqQueryBytes of query and luceneSqCodeBytes of every record for this code width, so
+    // reject a width or query length that does not match, before touching the context.
+    if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_IP)
+        || nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_L2)
+        || nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_COSINE)) {
+        if (docBits != 1 && docBits != 2 && docBits != 4) {
+            throw std::runtime_error("Unsupported SQ document code width docBits=" + std::to_string(docBits));
+        }
+        if (queryByteSize != luceneSqQueryBytes(dimension, docBits)) {
+            throw std::runtime_error("SQ query is " + std::to_string(queryByteSize) + " bytes, expected "
+                                     + std::to_string(luceneSqQueryBytes(dimension, docBits)) + " for dimension="
+                                     + std::to_string(dimension) + " docBits=" + std::to_string(docBits));
+        }
+    }
+
     // Free tmp buffer
     THREAD_LOCAL_SIMD_VEC_SRCH_CTX.tmpBuffer = {};
 
@@ -201,50 +236,73 @@ SimdVectorSearchContext* SimilarityFunction::saveSearchContext(
     // Copy query bytes
     std::memcpy(THREAD_LOCAL_SIMD_VEC_SRCH_CTX.queryVectorSimdAligned, queryPtr, queryByteSize);
 
+    // FP16 and BF16 share the same setup: they are 2-byte-per-component quantized
+    // formats whose per-vector similarity is offloaded to a Faiss SQDistanceComputer.
+    // Only the similarity function, the Faiss quantizer type and the metric differ.
+    auto setupFaissQuantizedFunction = [&](NativeSimilarityFunctionType functionType,
+                                           faiss::ScalarQuantizer::QuantizerType quantizerType,
+                                           faiss::MetricType metric) {
+        // Set similarity function to offload similarity calculation
+        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.similarityFunction = selectSimilarityFunction(functionType);
+
+        // FP16/BF16 vector bytes = 2bytes * dimension
+        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.oneVectorByteSize = 2 * dimension;
+
+        // Reset Faiss function for single vector similarity calculation
+        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction.reset(
+            faiss::ScalarQuantizer {static_cast<size_t>(dimension), quantizerType}
+                                   .get_distance_computer(metric));
+
+        // Assign query to Faiss function
+        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction->set_query(
+            reinterpret_cast<float*>(THREAD_LOCAL_SIMD_VEC_SRCH_CTX.queryVectorSimdAligned));
+    };
+
     // Set similarity function
     if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::FP16_MAXIMUM_INNER_PRODUCT)) {
-        // Set similarity function to offload similarity calculation
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.similarityFunction = selectSimilarityFunction(
-            NativeSimilarityFunctionType::FP16_MAXIMUM_INNER_PRODUCT);
-
-        // FP16 vector bytes = 2bytes * dimension
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.oneVectorByteSize = 2 * dimension;
-
-        // Reset Faiss function for single vector similarity calculation
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction.reset(
-             faiss::ScalarQuantizer {static_cast<size_t>(dimension), faiss::ScalarQuantizer::QuantizerType::QT_fp16}
-                                    .get_distance_computer(faiss::MetricType::METRIC_INNER_PRODUCT));
-
-        // Assign query to Faiss function
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction->set_query(
-            reinterpret_cast<float*>(THREAD_LOCAL_SIMD_VEC_SRCH_CTX.queryVectorSimdAligned));
+        setupFaissQuantizedFunction(NativeSimilarityFunctionType::FP16_MAXIMUM_INNER_PRODUCT,
+                                    faiss::ScalarQuantizer::QuantizerType::QT_fp16,
+                                    faiss::MetricType::METRIC_INNER_PRODUCT);
     } else if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::FP16_L2)) {
-        // Set similarity function to offload similarity calculation
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.similarityFunction = selectSimilarityFunction(
-            NativeSimilarityFunctionType::FP16_L2);
-
-        // FP16 vector bytes = 2bytes * dimension
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.oneVectorByteSize = 2 * dimension;
-
-        // Reset Faiss function for single vector similarity calculation
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction.reset(
-            faiss::ScalarQuantizer {static_cast<size_t>(dimension), faiss::ScalarQuantizer::QuantizerType::QT_fp16}
-                                   .get_distance_computer(faiss::MetricType::METRIC_L2));
-
-        // Assign query to Faiss function
-        THREAD_LOCAL_SIMD_VEC_SRCH_CTX.faissFunction->set_query(
-            reinterpret_cast<float*>(THREAD_LOCAL_SIMD_VEC_SRCH_CTX.queryVectorSimdAligned));
+        setupFaissQuantizedFunction(NativeSimilarityFunctionType::FP16_L2,
+                                    faiss::ScalarQuantizer::QuantizerType::QT_fp16,
+                                    faiss::MetricType::METRIC_L2);
+    } else if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::FP16_COSINE)) {
+        // FP16_COSINE shares the on-disk FP16 layout with FP16_MAX_INNER_PRODUCT. Vectors are
+        // L2-normalized at index time, so cosine equals the inner product, and the kernel emits
+        // a (1 + dot) / 2 Lucene score directly via cosineTransform. On platforms with native
+        // AVX-512-FP16 support FP16_COSINE binds to AVX512NativeFP16IP (true FP16 FMA, 32
+        // elements per 512-bit register); elsewhere it falls back to the FP32-converted IP
+        // kernel used by FP16_MAX_INNER_PRODUCT. The single-vector calculateSimilarity path
+        // goes through BaseSimilarityFunction, which calls the Faiss IP distance computer
+        // (set up here with METRIC_INNER_PRODUCT) and applies cosineTransform on top of the raw
+        // IP result.
+        setupFaissQuantizedFunction(NativeSimilarityFunctionType::FP16_COSINE,
+                                    faiss::ScalarQuantizer::QuantizerType::QT_fp16,
+                                    faiss::MetricType::METRIC_INNER_PRODUCT);
+    } else if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::BF16_MAXIMUM_INNER_PRODUCT)) {
+        setupFaissQuantizedFunction(NativeSimilarityFunctionType::BF16_MAXIMUM_INNER_PRODUCT,
+                                    faiss::ScalarQuantizer::QuantizerType::QT_bf16,
+                                    faiss::MetricType::METRIC_INNER_PRODUCT);
+    } else if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::BF16_L2)) {
+        setupFaissQuantizedFunction(NativeSimilarityFunctionType::BF16_L2,
+                                    faiss::ScalarQuantizer::QuantizerType::QT_bf16,
+                                    faiss::MetricType::METRIC_L2);
     } else if (nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_IP)
-               || nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_L2)) {
+               || nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_L2)
+               || nativeFunctionTypeOrd == static_cast<int32_t>(NativeSimilarityFunctionType::SQ_COSINE)) {
+         // SQ_COSINE shares on-disk layout and IP math with SQ_IP; only the score-transform kernel differs.
          // Set similarity function to offload similarity calculation
          THREAD_LOCAL_SIMD_VEC_SRCH_CTX.similarityFunction =
              selectSimilarityFunction(static_cast<NativeSimilarityFunctionType>(nativeFunctionTypeOrd));
 
+         THREAD_LOCAL_SIMD_VEC_SRCH_CTX.docBits = docBits;
+
          // oneVectorByteSize = quantized vector bytes + 3 floats + 1 int (correction factors)
          // On-disk layout: [binaryCode | lowerInterval(float) | upperInterval(float) | additionalCorrection(float) | quantizedComponentSum(int)]
-         // Lucene's docPackedLength for SINGLE_BIT_QUERY_NIBBLE: (dim + 7) / 8
+         // binaryCode is Lucene's docPackedLength for the encoding (luceneSqCodeBytes).
          THREAD_LOCAL_SIMD_VEC_SRCH_CTX.oneVectorByteSize =
-             (dimension + 7) / 8 + 3 * sizeof(float) + sizeof(int32_t);
+             luceneSqCodeBytes(dimension, docBits) + 3 * sizeof(float) + sizeof(int32_t);
     } else {
         throw std::runtime_error(
             std::string("Invalid native similarity function type was given, nativeFunctionTypeOrd=")
@@ -281,11 +339,22 @@ SimdVectorSearchContext* SimilarityFunction::getSearchContext() {
     return &THREAD_LOCAL_SIMD_VEC_SRCH_CTX;
 }
 
+void SimilarityFunction::updateVectorChunk(uint8_t* vectorsPtr, const int64_t vectorsByteSize) {
+    THREAD_LOCAL_SIMD_VEC_SRCH_CTX.mmapPages.clear();
+    THREAD_LOCAL_SIMD_VEC_SRCH_CTX.mmapPages.emplace_back(reinterpret_cast<void*>(vectorsPtr));
+    THREAD_LOCAL_SIMD_VEC_SRCH_CTX.mmapPageSizes.clear();
+    THREAD_LOCAL_SIMD_VEC_SRCH_CTX.mmapPageSizes.emplace_back(vectorsByteSize);
+}
+
 //
 // Similarity function base
 //
-using BulkScoreTransform = void (*)(float*/*scores*/, int32_t/*num scores to transform*/);
-using ScoreTransform = float (*)(float/*score*/);
+// The score transforms and the SQ metric mode live in similarity_function.h so the storage-format headers
+// (sq_format.h, fp16_format.h, bf16_format.h) can refer to them; they are pulled into this file's scope for the
+// ISA kernels that include it.
+using knn_jni::simd::similarity_function::BulkScoreTransform;
+using knn_jni::simd::similarity_function::ScoreTransform;
+using knn_jni::simd::similarity_function::SQMetricMode;
 
 template <BulkScoreTransform BulkScoreTransformFunc, ScoreTransform ScoreTransformFunc>
 struct BaseSimilarityFunction : SimilarityFunction {

@@ -207,7 +207,8 @@ jlong knn_jni::faiss_wrapper::InitFaissSQIndex(knn_jni::JNIUtilInterface *jniUti
                                                 jobject parametersJ,
                                                 BinaryIndexService *indexService,
                                                 jfloat centroidDp,
-                                                jint quantizedVecBytes) {
+                                                jint quantizedVecBytes,
+                                                jint docBits) {
     if (dimJ <= 0) {
         throw std::runtime_error("Vectors dimensions cannot be less than or equal to 0");
     }
@@ -253,7 +254,8 @@ jlong knn_jni::faiss_wrapper::InitFaissSQIndex(knn_jni::JNIUtilInterface *jniUti
                                            threadCount,
                                            std::move(subParametersCpp),
                                            centroidDp,
-                                           quantizedVecBytes);
+                                           quantizedVecBytes,
+                                           docBits);
 }
 
 void knn_jni::faiss_wrapper::InsertToIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
@@ -358,21 +360,16 @@ void knn_jni::faiss_wrapper::CreateIndexFromTemplate(knn_jni::JNIUtilInterface *
     // ArrayInvertedLists which has no read_only check and writes to in-memory
     // std::vectors unconditionally.
     std::unique_ptr<faiss::Index> indexWriter;
-    try {
-        indexWriter.reset(faiss::read_index(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
-        validateTemplateIndex(indexWriter.get());
-    } catch (...) {
-        delete inputVectors;
-        throw;
-    }
+    indexWriter.reset(faiss::read_index(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
+    validateTemplateIndex(indexWriter.get());
 
     auto idVector = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
     faiss::IndexIDMap idMap =  faiss::IndexIDMap(indexWriter.get());
     idMap.add_with_ids(numVectors, inputVectors->data(), idVector.data());
-    // Releasing the vectorsAddressJ memory as that is not required once we have created the index.
-    // This is not the ideal approach, please refer this gh issue for long term solution:
-    // https://github.com/opensearch-project/k-NN/issues/1600
-    delete inputVectors;
+    // Releasing the vectorsAddressJ memory as that is not required once we have created the index. Only the
+    // contents are released here: the std::vector itself is owned and freed by the Java caller
+    // (OffHeapVectorTransfer#close), so deleting it here would double free if a later step throws.
+    std::vector<float>().swap(*inputVectors);
 
     // Write the index to disk
     knn_jni::stream::NativeEngineIndexOutputMediator mediator {jniUtil, env, output};
@@ -440,21 +437,16 @@ void knn_jni::faiss_wrapper::CreateBinaryIndexFromTemplate(knn_jni::JNIUtilInter
     // ArrayInvertedLists which has no read_only check and writes to in-memory
     // std::vectors unconditionally.
     std::unique_ptr<faiss::IndexBinary> indexWriter;
-    try {
-        indexWriter.reset(faiss::read_index_binary(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
-        validateTemplateIndex(indexWriter.get());
-    } catch (...) {
-        delete inputVectors;
-        throw;
-    }
+    indexWriter.reset(faiss::read_index_binary(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
+    validateTemplateIndex(indexWriter.get());
 
     auto idVector = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
     faiss::IndexBinaryIDMap idMap =  faiss::IndexBinaryIDMap(indexWriter.get());
     idMap.add_with_ids(numVectors, reinterpret_cast<const uint8_t*>(inputVectors->data()), idVector.data());
-    // Releasing the vectorsAddressJ memory as that is not required once we have created the index.
-    // This is not the ideal approach, please refer this gh issue for long term solution:
-    // https://github.com/opensearch-project/k-NN/issues/1600
-    delete inputVectors;
+    // Releasing the vectorsAddressJ memory as that is not required once we have created the index. Only the
+    // contents are released here: the std::vector itself is owned and freed by the Java caller
+    // (OffHeapVectorTransfer#close), so deleting it here would double free if a later step throws.
+    std::vector<uint8_t>().swap(*inputVectors);
 
     // Write the index to disk
     knn_jni::stream::NativeEngineIndexOutputMediator mediator {jniUtil, env, output};
@@ -522,13 +514,8 @@ void knn_jni::faiss_wrapper::CreateByteIndexFromTemplate(knn_jni::JNIUtilInterfa
     // ArrayInvertedLists which has no read_only check and writes to in-memory
     // std::vectors unconditionally.
     std::unique_ptr<faiss::Index> indexWriter;
-    try {
-        indexWriter.reset(faiss::read_index(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
-        validateTemplateIndex(indexWriter.get());
-    } catch (...) {
-        delete inputVectors;
-        throw;
-    }
+    indexWriter.reset(faiss::read_index(&vectorIoReader, faiss::IO_FLAG_READ_ONLY));
+    validateTemplateIndex(indexWriter.get());
 
     auto ids = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
     faiss::IndexIDMap idMap =  faiss::IndexIDMap(indexWriter.get());
@@ -554,10 +541,10 @@ void knn_jni::faiss_wrapper::CreateByteIndexFromTemplate(knn_jni::JNIUtilInterfa
         idMap.add_with_ids(batchSize, inputFloatVectors.data(), floatVectorsIds.data());
     }
 
-    // Releasing the vectorsAddressJ memory as that is not required once we have created the index.
-    // This is not the ideal approach, please refer this gh issue for long term solution:
-    // https://github.com/opensearch-project/k-NN/issues/1600
-    delete inputVectors;
+    // Releasing the vectorsAddressJ memory as that is not required once we have created the index. Only the
+    // contents are released here: the std::vector itself is owned and freed by the Java caller
+    // (OffHeapVectorTransfer#close), so deleting it here would double free if a later step throws.
+    std::vector<int8_t>().swap(*inputVectors);
 
     // Write the index to disk
     knn_jni::stream::NativeEngineIndexOutputMediator mediator {jniUtil, env, output};

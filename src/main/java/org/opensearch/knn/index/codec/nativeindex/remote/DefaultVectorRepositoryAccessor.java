@@ -18,7 +18,6 @@ import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.knn.index.VectorDataType;
-import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.store.IndexOutputWithBuffer;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
 
@@ -70,7 +69,10 @@ public class DefaultVectorRepositoryAccessor implements VectorRepositoryAccessor
         long vectorBlobLength = (long) knnVectorValues.bytesPerVector() * totalLiveDocs;
 
         // TODO : Once Lucene patch https://github.com/apache/lucene/issues/14992 is merged, remove vector data type check in condition.
-        if (vectorDataType == VectorDataType.FLOAT && blobContainer instanceof AsyncMultiStreamBlobContainer asyncBlobContainer) {
+        // That issue is specific to MergedByteVectorValues (BYTE/BINARY); HALF_FLOAT rides on Lucene's
+        // FloatVectorValues under the hood (see KNNHalfFloatVectorValues), same as FLOAT, so it isn't affected.
+        if ((vectorDataType == VectorDataType.FLOAT || vectorDataType == VectorDataType.HALF_FLOAT)
+            && blobContainer instanceof AsyncMultiStreamBlobContainer asyncBlobContainer) {
             // First initiate vectors upload
             log.debug("Container {} Supports Parallel Blob Upload", blobContainer);
             // WriteContext is the main entry point into asyncBlobUpload. It stores all of our upload configurations, analogous to
@@ -228,12 +230,16 @@ public class DefaultVectorRepositoryAccessor implements VectorRepositoryAccessor
     }
 
     @Override
-    public void readFromRepository(String fileName, IndexOutputWithBuffer indexOutputWithBuffer) throws IOException {
+    public void readFromRepository(String fileName, String expectedExtension, IndexOutputWithBuffer indexOutputWithBuffer)
+        throws IOException {
         if (StringUtils.isBlank(fileName)) {
             throw new IllegalArgumentException("download path is null or empty");
         }
-        if (!fileName.endsWith(KNNEngine.FAISS.getExtension())) {
-            log.error("file name [{}] does not end with extension [{}}", fileName, KNNEngine.FAISS.getExtension());
+        if (StringUtils.isBlank(expectedExtension)) {
+            throw new IllegalArgumentException("expected file extension is null or empty");
+        }
+        if (!fileName.endsWith(expectedExtension)) {
+            log.error("file name [{}] does not end with extension [{}]", fileName, expectedExtension);
             throw new IllegalArgumentException("download path has incorrect file extension");
         }
 

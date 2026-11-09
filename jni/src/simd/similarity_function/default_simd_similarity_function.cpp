@@ -1,3 +1,8 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -8,32 +13,63 @@
 #include "simd_similarity_function_common.cpp"
 #include "faiss_score_to_lucene_transform.cpp"
 #include "parameter_utils.h"
+#include "simd/similarity_function/sq_format.h"
+#include "simd/similarity_function/sq_search_multibit_kernels.h"
+#include "simd/similarity_function/fp16_format.h"
+#include "simd/similarity_function/bf16_format.h"
+
+using knn_jni::simd::similarity_function::LuceneSqFormat;
+using knn_jni::simd::similarity_function::is_sq_format;
+using knn_jni::simd::similarity_function::scoreLuceneSqMultiBit;
+using knn_jni::simd::similarity_function::sqSearchKernel;
+using knn_jni::simd::similarity_function::LuceneFp16Format;
+using knn_jni::simd::similarity_function::is_fp16_format;
+using knn_jni::simd::similarity_function::LuceneBf16Format;
+using knn_jni::simd::similarity_function::is_bf16_format;
 
 //
-// FP16
+// Default (non-SIMD) similarity function backed by Faiss's SQDistanceComputer.
+// Generic over the storage format (fp16_format.h / bf16_format.h, used for both FP16 and BF16), since the format
+// only has to say where a vector lives: the actual decoding is delegated to the Faiss distance computer.
 //
+template <typename Format, BulkScoreTransform BulkScoreTransformFunc, ScoreTransform ScoreTransformFunc>
+struct DefaultFaissSimilarityFunction final : BaseSimilarityFunction<BulkScoreTransformFunc, ScoreTransformFunc> {
+    static_assert(is_fp16_format<Format>::value || is_bf16_format<Format>::value,
+                  "Format must be one of the fp16_format.h or bf16_format.h formats");
 
+    // Scores `internalVectorIds[0..numVectors)` into `scores` with the Faiss distance computer. Format locates each
+    // vector's values; Epilogue turns the raw distances into scores in place. Both are compile-time parameters.
+    template <typename Epilogue>
+    static FORCE_INLINE void scoreInBulk(const Format& format,
+                                         const Epilogue& epilogue,
+                                         faiss::ScalarQuantizer::SQDistanceComputer* func,
+                                         int32_t* internalVectorIds,
+                                         float* scores,
+                                         const int32_t numVectors) {
+        for (int32_t i = 0 ; i < numVectors ; ++i) {
+            // Calculate distance
+            const auto* vector = format.getVectorPointer(internalVectorIds[i]);
+            scores[i] = func->query_to_code(vector);
+        }
 
-template <BulkScoreTransform BulkScoreTransformFunc, ScoreTransform ScoreTransformFunc>
-struct DefaultFP16SimilarityFunction final : BaseSimilarityFunction<BulkScoreTransformFunc, ScoreTransformFunc> {
+        // Transform score values if it needs to
+        epilogue.finishInBulk(scores, numVectors);
+    }
+
     void calculateSimilarityInBulk(SimdVectorSearchContext* srchContext,
                                    int32_t* internalVectorIds,
                                    float* scores,
                                    const int32_t numVectors) {
-
         // Prepare similarity calculation
         auto func = dynamic_cast<faiss::ScalarQuantizer::SQDistanceComputer*>(srchContext->faissFunction.get());
         knn_jni::util::ParameterCheck::require_non_null(
             func, "Unexpected distance function acquired. Expected SQDistanceComputer, but it was something else");
 
-        for (int32_t i = 0 ; i < numVectors ; ++i) {
-            // Calculate distance
-            auto vector = reinterpret_cast<uint8_t*>(srchContext->getVectorPointer(internalVectorIds[i]));
-            scores[i] = func->query_to_code(vector);
-        }
+        // Lucene's flat records; the transform is the one this function was instantiated with.
+        const Format format(srchContext);
+        const typename Format::template Epilogue<BulkScoreTransformFunc> epilogue{};
 
-        // Transform score values if it needs to
-        BulkScoreTransformFunc(scores, numVectors);
+        scoreInBulk(format, epilogue, func, internalVectorIds, scores, numVectors);
     }
 };
 
@@ -41,10 +77,19 @@ struct DefaultFP16SimilarityFunction final : BaseSimilarityFunction<BulkScoreTra
 // FP16
 //
 // 1. Max IP
-DefaultFP16SimilarityFunction<FaissScoreToLuceneScoreTransform::ipToMaxIpTransformBulk, FaissScoreToLuceneScoreTransform::ipToMaxIpTransform> DEFAULT_FP16_MAX_INNER_PRODUCT_SIMIL_FUNC;
+DefaultFaissSimilarityFunction<LuceneFp16Format, FaissScoreToLuceneScoreTransform::ipToMaxIpTransformBulk, FaissScoreToLuceneScoreTransform::ipToMaxIpTransform> DEFAULT_FP16_MAX_INNER_PRODUCT_SIMIL_FUNC;
 // 2. L2
-DefaultFP16SimilarityFunction<FaissScoreToLuceneScoreTransform::l2TransformBulk, FaissScoreToLuceneScoreTransform::l2Transform> DEFAULT_FP16_L2_SIMIL_FUNC;
+DefaultFaissSimilarityFunction<LuceneFp16Format, FaissScoreToLuceneScoreTransform::l2TransformBulk, FaissScoreToLuceneScoreTransform::l2Transform> DEFAULT_FP16_L2_SIMIL_FUNC;
+// 3. Cosine (same IP kernel, but with cosine score transform for L2-normalized vectors)
+DefaultFaissSimilarityFunction<LuceneFp16Format, FaissScoreToLuceneScoreTransform::cosineTransformBulk, FaissScoreToLuceneScoreTransform::cosineTransform> DEFAULT_FP16_COSINE_SIMIL_FUNC;
 
+//
+// BF16 - Uses the same default (Faiss SQDistanceComputer-based) approach as FP16
+//
+// 1. Max IP
+DefaultFaissSimilarityFunction<LuceneBf16Format, FaissScoreToLuceneScoreTransform::ipToMaxIpTransformBulk, FaissScoreToLuceneScoreTransform::ipToMaxIpTransform> DEFAULT_BF16_MAX_INNER_PRODUCT_SIMIL_FUNC;
+// 2. L2
+DefaultFaissSimilarityFunction<LuceneBf16Format, FaissScoreToLuceneScoreTransform::l2TransformBulk, FaissScoreToLuceneScoreTransform::l2Transform> DEFAULT_BF16_L2_SIMIL_FUNC;
 
 //
 // SQ (ADC: 4-bit query x 1-bit data) - Default (non-SIMD) implementation
@@ -59,22 +104,8 @@ DefaultFP16SimilarityFunction<FaissScoreToLuceneScoreTransform::l2TransformBulk,
 //          + popcount(plane2 AND data) * 4
 //          + popcount(plane3 AND data) * 8
 //
-
-static constexpr float FOUR_BIT_SCALE = 1.0f / 15.0f;
-
-// Reads the per-vector correction factors from a potentially unaligned address.
-// On-disk layout after binaryCode: [lowerInterval(f32)][upperInterval(f32)][additionalCorrection(f32)][quantizedComponentSum(i32)]
-static FORCE_INLINE void readDataCorrections(const uint8_t* ptr, float& ax, float& lx, float& additional, float& x1) {
-    float lower, upper;
-    std::memcpy(&lower,      ptr,      sizeof(float));
-    std::memcpy(&upper,      ptr + 4,  sizeof(float));
-    std::memcpy(&additional, ptr + 8,  sizeof(float));
-    int32_t componentSum;
-    std::memcpy(&componentSum, ptr + 12, sizeof(int32_t));
-    ax = lower;
-    lx = upper - lower;
-    x1 = static_cast<float>(componentSum);
-}
+// Where a vector's code bytes and correction factors live, and how they combine into a score, is the storage format's
+// business (sq_format.h): the kernel below only computes the code dot products.
 
 // Scalar int4BitDotProduct
 // q has 4 * binaryCodeBytes bytes (4 bit planes), d has binaryCodeBytes bytes.
@@ -156,24 +187,20 @@ static FORCE_INLINE void default4bitDotProductBatch(
     }
 }
 
-template <bool IsMaxIP>
+template <SQMetricMode Mode>
 struct DefaultSQSimilarityFunction final : SimilarityFunction {
-    HOT_SPOT void calculateSimilarityInBulk(SimdVectorSearchContext* srchContext,
-                                            int32_t* internalVectorIds,
-                                            float* scores,
-                                            const int32_t numVectors) {
-        const auto* queryPtr = reinterpret_cast<const uint8_t*>(srchContext->queryVectorSimdAligned);
-        const int32_t dim = srchContext->dimension;
-        const int32_t binaryCodeBytes = (dim + 7) / 8;
-
-        // Read query correction factors from tmpBuffer
-        const auto* queryCorrectionPtr = reinterpret_cast<const float*>(srchContext->tmpBuffer.data());
-        const float ay = queryCorrectionPtr[0];
-        const float ly = (queryCorrectionPtr[1] - queryCorrectionPtr[0]) * FOUR_BIT_SCALE;
-        const float queryAdditional = queryCorrectionPtr[2];
-        int32_t y1Raw; std::memcpy(&y1Raw, &queryCorrectionPtr[3], sizeof(int32_t));
-        const float y1 = static_cast<float>(y1Raw);
-        const float centroidDp = queryCorrectionPtr[4];
+    // Scores `internalVectorIds[0..numVectors)` into `scores`. Format (sq_format.h) locates each vector's code bytes
+    // and correction factors; Epilogue turns a code dot product and those corrections into a score. Both are
+    // compile-time parameters. Mode is not used here; it selects the Lucene epilogue in the two virtuals below.
+    template <typename Format, typename Epilogue>
+    static FORCE_INLINE void scoreInBulk(const Format& format,
+                                         const Epilogue& epilogue,
+                                         const uint8_t* queryPtr,
+                                         const int32_t binaryCodeBytes,
+                                         int32_t* internalVectorIds,
+                                         float* scores,
+                                         const int32_t numVectors) {
+        static_assert(is_sq_format<Format>::value, "Format must be one of the sq_format.h formats");
 
         int32_t processedCount = 0;
         constexpr int32_t vecBlock = 8;
@@ -182,108 +209,118 @@ struct DefaultSQSimilarityFunction final : SimilarityFunction {
 
         // Batch size 8
         for ( ; (processedCount + vecBlock) <= numVectors ; processedCount += vecBlock) {
-            srchContext->getVectorPointersInBulk(vectors, &internalVectorIds[processedCount], vecBlock);
+            format.getVectorPointersInBulk(vectors, &internalVectorIds[processedCount], vecBlock);
             default4bitDotProductBatch<vecBlock>(queryPtr, vectors, binaryCodeBytes, &scores[processedCount]);
 
             for (int32_t i = 0 ; i < vecBlock ; ++i) {
                 float ax, lx, additional, x1;
-                readDataCorrections(vectors[i] + binaryCodeBytes, ax, lx, additional, x1);
+                format.readDataCorrections(vectors[i], internalVectorIds[processedCount + i], ax, lx, additional, x1);
 
-                scores[processedCount + i] = ax * ay * dim
-                                           + ay * lx * x1
-                                           + ax * ly * y1
-                                           + lx * ly * scores[processedCount + i];
-
-                if constexpr (IsMaxIP) {
-                    scores[processedCount + i] += queryAdditional + additional - centroidDp;
-                } else {
-                    scores[processedCount + i] = std::max(0.0F, queryAdditional + additional - 2 * scores[processedCount + i]);
-                }
+                scores[processedCount + i] = epilogue.finish(ax, lx, additional, x1, scores[processedCount + i]);
             }
         }
 
         // Batch size 4
         for ( ; (processedCount + vecHalfBlock) <= numVectors ; processedCount += vecHalfBlock) {
-            srchContext->getVectorPointersInBulk(vectors, &internalVectorIds[processedCount], vecHalfBlock);
+            format.getVectorPointersInBulk(vectors, &internalVectorIds[processedCount], vecHalfBlock);
             default4bitDotProductBatch<vecHalfBlock>(queryPtr, vectors, binaryCodeBytes, &scores[processedCount]);
 
             for (int32_t i = 0 ; i < vecHalfBlock ; ++i) {
                 float ax, lx, additional, x1;
-                readDataCorrections(vectors[i] + binaryCodeBytes, ax, lx, additional, x1);
+                format.readDataCorrections(vectors[i], internalVectorIds[processedCount + i], ax, lx, additional, x1);
 
-                scores[processedCount + i] = ax * ay * dim
-                                           + ay * lx * x1
-                                           + ax * ly * y1
-                                           + lx * ly * scores[processedCount + i];
-
-                if constexpr (IsMaxIP) {
-                    scores[processedCount + i] += queryAdditional + additional - centroidDp;
-                } else {
-                    scores[processedCount + i] =
-                        std::max(0.0F, queryAdditional + additional - 2 * scores[processedCount + i]);
-                }
+                scores[processedCount + i] = epilogue.finish(ax, lx, additional, x1, scores[processedCount + i]);
             }
         }
 
         // Tail: remaining vectors (scalar)
         for ( ; processedCount < numVectors ; ++processedCount) {
-            const auto* dataVec = srchContext->getVectorPointer(internalVectorIds[processedCount]);
+            const auto* dataVec = format.getVectorPointer(internalVectorIds[processedCount]);
             const float qcDist = static_cast<float>(
                 int4BitDotProduct(queryPtr, dataVec, binaryCodeBytes));
 
             float ax, lx, additional, x1;
-            readDataCorrections(dataVec + binaryCodeBytes, ax, lx, additional, x1);
+            format.readDataCorrections(dataVec, internalVectorIds[processedCount], ax, lx, additional, x1);
 
-            scores[processedCount] = ax * ay * dim
-                                   + ay * lx * x1
-                                   + ax * ly * y1
-                                   + lx * ly * qcDist;
+            scores[processedCount] = epilogue.finish(ax, lx, additional, x1, qcDist);
+        }
+    }
 
-            if constexpr (IsMaxIP) {
-                scores[processedCount] += queryAdditional + additional - centroidDp;
-            } else {
-                scores[processedCount] =
-                    std::max(0.0F, queryAdditional + additional - 2 * scores[processedCount]);
-            }
+    // Scores Lucene's interleaved records (LuceneSqFormat) for the context's document code width: 1-bit
+    // (SINGLE_BIT_QUERY_NIBBLE) with this file's kernel, 2-bit (DIBIT_QUERY_NIBBLE) and 4-bit (PACKED_NIBBLE) with the
+    // runtime-dispatched kernels of sq_search_multibit_kernels.h. The scores are the Faiss-domain values; the callers
+    // apply the score transform of Mode.
+    static FORCE_INLINE void scoreLuceneSq(SimdVectorSearchContext* srchContext,
+                                           int32_t* internalVectorIds,
+                                           float* scores,
+                                           const int32_t numVectors) {
+        const auto* queryPtr = reinterpret_cast<const uint8_t*>(srchContext->queryVectorSimdAligned);
+
+        if (srchContext->docBits != 1) {
+            const int32_t codeBytes = luceneSqCodeBytes(srchContext->dimension, srchContext->docBits);
+            const LuceneSqFormat format(srchContext, codeBytes);
+            const LuceneSqFormat::MultiBitEpilogue<Mode> epilogue(srchContext);
+            // A 2-bit code is bit plane 0 then bit plane 1; the dot product runs over one stripe.
+            scoreLuceneSqMultiBit(format, epilogue, sqSearchKernel(srchContext->docBits), queryPtr,
+                                  srchContext->docBits == 2 ? codeBytes / 2 : codeBytes, internalVectorIds, scores,
+                                  numVectors);
+            return;
         }
 
-        if constexpr (IsMaxIP) {
+        // 1-bit codes: unchanged.
+        const int32_t binaryCodeBytes = (srchContext->dimension + 7) / 8;
+
+        // Lucene's interleaved records; the query correction factors come from tmpBuffer.
+        const LuceneSqFormat format(srchContext, binaryCodeBytes);
+        const LuceneSqFormat::Epilogue<Mode> epilogue(srchContext);
+
+        scoreInBulk(format, epilogue, queryPtr, binaryCodeBytes, internalVectorIds, scores, numVectors);
+    }
+
+    HOT_SPOT void calculateSimilarityInBulk(SimdVectorSearchContext* srchContext,
+                                            int32_t* internalVectorIds,
+                                            float* scores,
+                                            const int32_t numVectors) {
+        scoreLuceneSq(srchContext, internalVectorIds, scores, numVectors);
+
+        if constexpr (Mode == SQMetricMode::MAX_IP) {
             FaissScoreToLuceneScoreTransform::ipToMaxIpTransformBulk(scores, numVectors);
+        } else if constexpr (Mode == SQMetricMode::COSINE) {
+            FaissScoreToLuceneScoreTransform::cosineTransformBulk(scores, numVectors);
         } else {
             FaissScoreToLuceneScoreTransform::l2TransformBulk(scores, numVectors);
         }
     }
 
     float calculateSimilarity(SimdVectorSearchContext* srchContext, const int32_t internalVectorId) {
-        const auto* queryPtr = reinterpret_cast<const uint8_t*>(srchContext->queryVectorSimdAligned);
-        const int32_t dim = srchContext->dimension;
-        const int32_t binaryCodeBytes = (dim + 7) / 8;
-
-        const auto* queryCorrectionPtr = reinterpret_cast<const float*>(srchContext->tmpBuffer.data());
-        const float ay = queryCorrectionPtr[0];
-        const float ly = (queryCorrectionPtr[1] - queryCorrectionPtr[0]) * FOUR_BIT_SCALE;
-        const float queryAdditional = queryCorrectionPtr[2];
-        int32_t y1Raw; std::memcpy(&y1Raw, &queryCorrectionPtr[3], sizeof(int32_t));
-        const float y1 = static_cast<float>(y1Raw);
-        const float centroidDp = queryCorrectionPtr[4];
-
-        const auto* dataVec = srchContext->getVectorPointer(internalVectorId);
-        const float qcDist = static_cast<float>(
-            int4BitDotProduct(queryPtr, dataVec, binaryCodeBytes));
-
-        float ax, lx, additional, x1;
-        readDataCorrections(dataVec + binaryCodeBytes, ax, lx, additional, x1);
-
-        float score = ax * ay * dim
-                    + ay * lx * x1
-                    + ax * ly * y1
-                    + lx * ly * qcDist;
-
-        if constexpr (IsMaxIP) {
-            score += queryAdditional + additional - centroidDp;
-            return FaissScoreToLuceneScoreTransform::ipToMaxIpTransform(score);
+        float score;
+        if (srchContext->docBits != 1) {
+            // One 2- or 4-bit vector goes through the same kernels and epilogue as the bulk path.
+            int32_t vectorId = internalVectorId;
+            scoreLuceneSq(srchContext, &vectorId, &score, 1);
         } else {
-            score = std::max(0.0F, queryAdditional + additional - 2 * score);
+            // 1-bit codes: unchanged.
+            const auto* queryPtr = reinterpret_cast<const uint8_t*>(srchContext->queryVectorSimdAligned);
+            const int32_t binaryCodeBytes = (srchContext->dimension + 7) / 8;
+
+            const LuceneSqFormat format(srchContext, binaryCodeBytes);
+            const LuceneSqFormat::Epilogue<Mode> epilogue(srchContext);
+
+            const auto* dataVec = format.getVectorPointer(internalVectorId);
+            const float qcDist = static_cast<float>(
+                int4BitDotProduct(queryPtr, dataVec, binaryCodeBytes));
+
+            float ax, lx, additional, x1;
+            format.readDataCorrections(dataVec, internalVectorId, ax, lx, additional, x1);
+
+            score = epilogue.finish(ax, lx, additional, x1, qcDist);
+        }
+
+        if constexpr (Mode == SQMetricMode::MAX_IP) {
+            return FaissScoreToLuceneScoreTransform::ipToMaxIpTransform(score);
+        } else if constexpr (Mode == SQMetricMode::COSINE) {
+            return FaissScoreToLuceneScoreTransform::cosineTransform(score);
+        } else {
             return FaissScoreToLuceneScoreTransform::l2Transform(score);
         }
     }
@@ -293,9 +330,11 @@ struct DefaultSQSimilarityFunction final : SimilarityFunction {
 // SQ
 //
 // 1. Max IP
-DefaultSQSimilarityFunction<true> SQ_IP_SIMIL_FUNC;
+DefaultSQSimilarityFunction<SQMetricMode::MAX_IP> SQ_IP_SIMIL_FUNC;
 // 2. L2
-DefaultSQSimilarityFunction<false> SQ_L2_SIMIL_FUNC;
+DefaultSQSimilarityFunction<SQMetricMode::L2> SQ_L2_SIMIL_FUNC;
+// 3. Cosine
+DefaultSQSimilarityFunction<SQMetricMode::COSINE> SQ_COSINE_SIMIL_FUNC;
 
 #ifndef __NO_SELECT_FUNCTION
 SimilarityFunction* SimilarityFunction::selectSimilarityFunction(const NativeSimilarityFunctionType nativeFunctionType) {
@@ -303,10 +342,18 @@ SimilarityFunction* SimilarityFunction::selectSimilarityFunction(const NativeSim
         return &DEFAULT_FP16_MAX_INNER_PRODUCT_SIMIL_FUNC;
     } else if (nativeFunctionType == NativeSimilarityFunctionType::FP16_L2) {
         return &DEFAULT_FP16_L2_SIMIL_FUNC;
+    } else if (nativeFunctionType == NativeSimilarityFunctionType::BF16_MAXIMUM_INNER_PRODUCT) {
+        return &DEFAULT_BF16_MAX_INNER_PRODUCT_SIMIL_FUNC;
+    } else if (nativeFunctionType == NativeSimilarityFunctionType::BF16_L2) {
+        return &DEFAULT_BF16_L2_SIMIL_FUNC;
     } else if (nativeFunctionType == NativeSimilarityFunctionType::SQ_IP) {
         return &SQ_IP_SIMIL_FUNC;
     } else if (nativeFunctionType == NativeSimilarityFunctionType::SQ_L2) {
         return &SQ_L2_SIMIL_FUNC;
+    } else if (nativeFunctionType == NativeSimilarityFunctionType::SQ_COSINE) {
+        return &SQ_COSINE_SIMIL_FUNC;
+    } else if (nativeFunctionType == NativeSimilarityFunctionType::FP16_COSINE) {
+        return &DEFAULT_FP16_COSINE_SIMIL_FUNC;
     }
 
     throw std::runtime_error("Invalid native similarity function type was given, nativeFunctionType="

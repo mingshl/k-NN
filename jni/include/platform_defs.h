@@ -1,3 +1,8 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #pragma once
 // Ensures this header file is included only once during compilation.
 // Prevents duplicate definition errors if included multiple times.
@@ -30,6 +35,17 @@
     // Fallback for other compilers
     #define FORCE_INLINE inline
 #endif // FORCE_INLINE_H
+
+// AT_HWCAP bit for the Armv8.2 dot-product instructions (asm/hwcap.h), with a fallback for libc headers that
+// predate it. Shared by the SQ indexing and search kernels' runtime CPU detection.
+#if defined(__aarch64__) && defined(__linux__)
+    #include <sys/auxv.h>
+    #if defined(HWCAP_ASIMDDP)
+        #define KNN_SQ_HWCAP_ASIMDDP HWCAP_ASIMDDP
+    #else
+        #define KNN_SQ_HWCAP_ASIMDDP (1UL << 20)
+    #endif
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
     #define HOT_SPOT [[gnu::hot]]

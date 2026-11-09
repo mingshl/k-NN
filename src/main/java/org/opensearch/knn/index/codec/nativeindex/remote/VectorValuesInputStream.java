@@ -8,9 +8,11 @@ package org.opensearch.knn.index.codec.nativeindex.remote;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.util.KNNVectorAsCollectionOfHalfFloatsSerializer;
 import org.opensearch.knn.index.vectorvalues.KNNBinaryVectorValues;
 import org.opensearch.knn.index.vectorvalues.KNNByteVectorValues;
 import org.opensearch.knn.index.vectorvalues.KNNFloatVectorValues;
+import org.opensearch.knn.index.vectorvalues.KNNHalfFloatVectorValues;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
 import org.opensearch.knn.index.vectorvalues.QuantizedKNNBinaryVectorValues;
 
@@ -23,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.opensearch.knn.index.VectorDataType.BINARY;
 import static org.opensearch.knn.index.VectorDataType.BYTE;
 import static org.opensearch.knn.index.VectorDataType.FLOAT;
+import static org.opensearch.knn.index.VectorDataType.HALF_FLOAT;
 import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorValues;
 
 /**
@@ -36,6 +39,8 @@ class VectorValuesInputStream extends InputStream {
     // will be filled 1 vector at a time.
     private ByteBuffer currentBuffer;
     private final int bytesPerVector;
+    // Reused per vector: fp16 encoding of the current vector, only allocated for HALF_FLOAT
+    private final byte[] halfFloatVectorBytes;
     private long bytesRemaining;
     private final VectorDataType vectorDataType;
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -66,6 +71,7 @@ class VectorValuesInputStream extends InputStream {
         this.vectorDataType = vectorDataType;
         initializeVectorValues(this.knnVectorValues);
         this.bytesPerVector = this.knnVectorValues.bytesPerVector();
+        this.halfFloatVectorBytes = vectorDataType == HALF_FLOAT ? new byte[bytesPerVector] : null;
         // We use currentBuffer == null to indicate that there are no more vectors to be read
         this.currentBuffer = ByteBuffer.allocate(bytesPerVector).order(ByteOrder.LITTLE_ENDIAN);
         // Position the InputStream at the specific byte within the specific vector that startPosition references
@@ -202,6 +208,13 @@ class VectorValuesInputStream extends InputStream {
         if (vectorDataType == FLOAT) {
             float[] floatVector = ((KNNFloatVectorValues) knnVectorValues).getVector();
             currentBuffer.asFloatBuffer().put(floatVector);
+        } else if (vectorDataType == HALF_FLOAT) {
+            // Encoded to fp16 (2 bytes per dimension) on the data node; the remote build service consumes fp16
+            // directly. This is the HALF_FLOAT field type only - a FLOAT field with the fp16 SQ encoder is
+            // still uploaded as raw fp32 and converted by the service.
+            float[] floatVector = ((KNNHalfFloatVectorValues) knnVectorValues).getVector();
+            KNNVectorAsCollectionOfHalfFloatsSerializer.INSTANCE.floatToByteArray(floatVector, halfFloatVectorBytes, floatVector.length);
+            currentBuffer.put(halfFloatVectorBytes);
         } else if (vectorDataType == BYTE) {
             byte[] byteVector = ((KNNByteVectorValues) knnVectorValues).getVector();
             currentBuffer.put(byteVector);

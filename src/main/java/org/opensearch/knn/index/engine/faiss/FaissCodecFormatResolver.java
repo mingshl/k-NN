@@ -9,11 +9,15 @@ import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.opensearch.common.Nullable;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
+import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990HalfFloatKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.CodecFormatResolver;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 
 import java.util.Map;
 
@@ -41,7 +45,10 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
 
     /**
      * Resolves the format for a specific field. Returns {@link Faiss1040ScalarQuantizedKnnVectorsFormat} when
-     * the encoder is sq with bits=1, otherwise falls back to the default native format.
+     * the encoder is sq with bits in {1, 2, 4} (the multi-bit MOS path), otherwise falls back to the default
+     * native format. The document bit width is resolved per-field at write time by the format itself from
+     * {@code SQ_CONFIG}, so the format instance stays encoding-agnostic and SPI-instantiated instances
+     * cannot silently miswrite fields.
      */
     @Override
     public KnnVectorsFormat resolve(
@@ -49,24 +56,25 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
         KNNMethodContext methodContext,
         Map<String, Object> params,
         int defaultMaxConnections,
-        int defaultBeamWidth
+        int defaultBeamWidth,
+        ResolvedIndexSpec resolvedSpec,
+        VectorDataType vectorDataType
     ) {
-        if (isSQOneBitEncoder(params)) {
-            return new Faiss1040ScalarQuantizedKnnVectorsFormat(
-                KNNSettings.getApproximateThresholdValue(mapperService),
-                nativeIndexBuildStrategyFactory
-            );
+        final int approximateThreshold = KNNSettings.getApproximateThresholdValue(mapperService);
+        if (vectorDataType == VectorDataType.HALF_FLOAT) {
+            return resolvedSpec.isFaissSQMultiBit()
+                ? new Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory)
+                : new NativeEngines990HalfFloatKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
         }
-        return resolve();
+
+        return resolvedSpec.isFaissSQMultiBit()
+            ? new Faiss1040ScalarQuantizedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory)
+            : resolve();
     }
 
     @Override
     public KnnVectorsFormat resolve() {
         final int approximateThreshold = KNNSettings.getApproximateThresholdValue(mapperService);
         return new NativeEngines990KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
-    }
-
-    private static boolean isSQOneBitEncoder(Map<String, Object> params) {
-        return FaissSQEncoder.isSQOneBit(params);
     }
 }

@@ -5,6 +5,8 @@
 
 package org.opensearch.knn.index.query;
 
+import java.util.Locale;
+
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -20,6 +22,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.search.NestedHelper;
 import org.opensearch.index.search.OpenSearchToParentBlockJoinQuery;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
@@ -53,6 +56,8 @@ public abstract class BaseQueryFactory {
         private byte[] byteVector;
         // TODO : This needs clean-up, `vectorFieldType` has it already.
         private VectorDataType vectorDataType;
+
+        private SpaceType spaceType;
         // TODO : This needs clean-up, `vectorFieldType` has it already.
         private Map<String, ?> methodParameters;
         private KNNVectorFieldType vectorFieldType;
@@ -63,6 +68,8 @@ public abstract class BaseQueryFactory {
         private RescoreContext rescoreContext;
         private boolean expandNested;
         private boolean memoryOptimizedSearchEnabled;
+        /** Coordinator-resolved request {@code size}; see {@link KNNQueryBuilder#getSize()}. */
+        private Integer size;
 
         public Optional<QueryBuilder> getFilter() {
             return Optional.ofNullable(filter);
@@ -92,6 +99,7 @@ public abstract class BaseQueryFactory {
             .orElseThrow(() -> new RuntimeException("Shard context cannot be null"));
         log.debug(
             String.format(
+                Locale.ROOT,
                 "Creating query with filter for index [%s], field [%s]",
                 createQueryRequest.getIndexName(),
                 createQueryRequest.getFieldName()

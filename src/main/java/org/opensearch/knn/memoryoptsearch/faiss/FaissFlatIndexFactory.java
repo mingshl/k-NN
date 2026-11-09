@@ -5,12 +5,14 @@
 
 package org.opensearch.knn.memoryoptsearch.faiss;
 
+import java.util.Locale;
+
 import lombok.experimental.UtilityClass;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.index.FieldInfo;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.SpaceType;
-import org.opensearch.knn.index.engine.faiss.FaissSQEncoder;
+import org.opensearch.knn.index.engine.Encoder.QuantizationBits;
 import org.opensearch.knn.memoryoptsearch.faiss.binary.FaissBinaryHnswIndex;
 import org.opensearch.knn.memoryoptsearch.faiss.binary.FaissBinaryIndex;
 import org.opensearch.knn.memoryoptsearch.faiss.cagra.FaissHNSWCagraIndex;
@@ -29,12 +31,13 @@ public class FaissFlatIndexFactory {
      * indices where flat storage was skipped (IO_FLAG_SKIP_STORAGE). Returns {@code null} if the field
      * does not require externally-provided flat storage.
      *
-     * <p>Currently supports SQ 1-bit. To add support for other flat storage types (e.g., fp32 flat),
-     * add new conditions here.
+     * <p>Supports the SQ memory-optimized-search path for bits in {1, 2, 4} — for all of these the
+     * .faiss file holds only the HNSW graph and the quantized codes live in Lucene's flat .veq file.
+     * To add support for other flat storage types (e.g., fp32 flat), add new conditions here.
      */
     static FaissIndex createFlatIndex(final FieldInfo fieldInfo, final FlatVectorsReader flatVectorsReader) {
         if (FieldInfoExtractor.isSQField(fieldInfo)
-            && FieldInfoExtractor.extractSQConfig(fieldInfo).getBits() == FaissSQEncoder.Bits.ONE.getValue()) {
+            && QuantizationBits.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits())) {
             return new FaissScalarQuantizedFlatIndex(flatVectorsReader, fieldInfo.getName());
         }
         return null;
@@ -70,6 +73,7 @@ public class FaissFlatIndexFactory {
             if (flatBinaryIndex == null) {
                 throw new IllegalStateException(
                     String.format(
+                        Locale.ROOT,
                         "%s found for field [%s] but %s returned null — cannot wire binary flat storage.",
                         FaissEmptyIndex.class.getName(),
                         fieldInfo.getName(),
@@ -100,6 +104,7 @@ public class FaissFlatIndexFactory {
             if (flatIndex == null) {
                 throw new IllegalStateException(
                     String.format(
+                        Locale.ROOT,
                         "%s found for field [%s] but %s returned null — cannot wire flat storage for CAGRA index.",
                         FaissEmptyIndex.class.getName(),
                         fieldInfo.getName(),

@@ -224,6 +224,7 @@ TEST(FaissCreateIndexFromTemplateTest, BasicAssertions) {
         faiss::idx_t numIds = 100;
         std::vector<faiss::idx_t> ids;
         auto *vectors = new std::vector<float>();
+        std::unique_ptr<std::vector<float>> vectorsOwner(vectors);
         int dim = 8;
         vectors->reserve(dim * numIds);
         for (int64_t i = 0; i < numIds; ++i) {
@@ -284,6 +285,7 @@ TEST(FaissCreateByteIndexFromTemplateTest, BasicAssertions) {
         faiss::idx_t numIds = 100;
         std::vector<faiss::idx_t> ids;
         auto *vectors = new std::vector<int8_t>();
+        std::unique_ptr<std::vector<int8_t>> vectorsOwner(vectors);
         int dim = 8;
         vectors->reserve(dim * numIds);
         for (int64_t i = 0; i < numIds; ++i) {
@@ -368,6 +370,7 @@ TEST(FaissCreateIndexFromTemplateTest, RejectsNonArrayInvertedLists) {
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<float>(
         test_util::RandomVectors(dim, numIds, randomDataMin, randomDataMax));
+    std::unique_ptr<std::vector<float>> vectorsOwner(vectors);
 
     // Setup jni
     std::string indexPath = test_util::RandomString(10, "tmp/", ".faiss");
@@ -416,6 +419,7 @@ TEST(FaissCreateIndexFromTemplateTest, RejectsWrappedIndex) {
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<float>(
         test_util::RandomVectors(dim, numIds, randomDataMin, randomDataMax));
+    std::unique_ptr<std::vector<float>> vectorsOwner(vectors);
 
     // Setup jni
     std::string indexPath = test_util::RandomString(10, "tmp/", ".faiss");
@@ -461,6 +465,7 @@ TEST(FaissCreateIndexFromTemplateTest, AcceptsValidIVFTemplate) {
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<float>(
         test_util::RandomVectors(dim, numIds, randomDataMin, randomDataMax));
+    std::unique_ptr<std::vector<float>> vectorsOwner(vectors);
 
     // Setup jni
     std::string indexPath = test_util::RandomString(10, "tmp/", ".faiss");
@@ -510,6 +515,7 @@ TEST(FaissCreateIndexFromTemplateTest, AcceptsValidHNSWPQTemplate) {
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<float>(
         test_util::RandomVectors(dim, numIds, randomDataMin, randomDataMax));
+    std::unique_ptr<std::vector<float>> vectorsOwner(vectors);
 
     // Setup jni
     std::string indexPath = test_util::RandomString(10, "tmp/", ".faiss");
@@ -563,6 +569,7 @@ TEST(FaissCreateByteIndexFromTemplateTest, RejectsNonArrayInvertedLists) {
     faiss::idx_t numIds = 10;
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<int8_t>(numIds * dim);
+    std::unique_ptr<std::vector<int8_t>> vectorsOwner(vectors);
     for (auto& v : *vectors) {
         v = static_cast<int8_t>(test_util::RandomInt(-128, 127));
     }
@@ -617,6 +624,7 @@ TEST(FaissCreateBinaryIndexFromTemplateTest, RejectsNonArrayInvertedLists) {
     faiss::idx_t numIds = 10;
     std::vector<faiss::idx_t> ids = test_util::Range(numIds);
     auto* vectors = new std::vector<uint8_t>(numIds * (dim / 8));
+    std::unique_ptr<std::vector<uint8_t>> vectorsOwner(vectors);
     for (auto& v : *vectors) {
         v = static_cast<uint8_t>(test_util::RandomInt(0, 255));
     }
@@ -1359,6 +1367,69 @@ TEST(FaissCreateHnswSQfp16IndexTest, BasicAssertions) {
 
     std::string spaceType = knn_jni::L2;
     std::string index_description = "HNSW32,SQfp16";
+
+    std::unordered_map<std::string, jobject> parametersMap;
+    parametersMap[knn_jni::SPACE_TYPE] = (jobject)&spaceType;
+    parametersMap[knn_jni::INDEX_DESCRIPTION] = (jobject)&index_description;
+
+    for (auto throwIOException : std::array<bool, 2> {false, true}) {
+        const std::string indexPath = test_util::RandomString(10, "tmp/", ".faiss");
+
+        // Set up jni
+        NiceMock<JNIEnv> jniEnv;
+        NiceMock<test_util::MockJNIUtil> mockJNIUtil;
+        JavaFileIndexOutputMock javaFileIndexOutputMock {indexPath};
+        setUpJavaFileOutputMocking(javaFileIndexOutputMock, mockJNIUtil, throwIOException);
+
+        EXPECT_CALL(mockJNIUtil,
+                    GetJavaObjectArrayLength(
+                        &jniEnv, reinterpret_cast<jobjectArray>(&vectors)))
+            .WillRepeatedly(Return(vectors.size()));
+
+        // Create the index
+        std::unique_ptr<FaissMethods> faissMethods(new FaissMethods());
+        knn_jni::faiss_wrapper::IndexService IndexService(std::move(faissMethods));
+
+        try {
+            createIndexIteratively(&mockJNIUtil, &jniEnv, ids, vectors, dim, (jobject) (&javaFileIndexOutputMock), parametersMap, &IndexService);
+            // Make sure we close a file stream before reopening the created file.
+            javaFileIndexOutputMock.file_writer.close();
+        } catch (const std::exception& e) {
+            ASSERT_STREQ("Failed to write index to disk", e.what());
+            ASSERT_TRUE(throwIOException);
+            continue;
+        }
+        ASSERT_FALSE(throwIOException);
+
+        // Make sure index can be loaded
+        std::unique_ptr<faiss::Index> index(test_util::FaissLoadIndex(indexPath));
+        auto indexIDMap =  dynamic_cast<faiss::IndexIDMap*>(index.get());
+
+        // Assert that Index is of type IndexHNSWSQ
+        ASSERT_NE(indexIDMap, nullptr);
+        ASSERT_NE(dynamic_cast<faiss::IndexHNSWSQ*>(indexIDMap->index), nullptr);
+
+        // Clean up
+        std::remove(indexPath.c_str());
+    }  // End for
+}
+
+TEST(FaissCreateHnswSQbf16IndexTest, BasicAssertions) {
+    // Define the data
+    faiss::idx_t numIds = 200;
+    std::vector<faiss::idx_t> ids;
+    std::vector<float> vectors;
+    int dim = 2;
+    vectors.reserve(dim * numIds);
+    for (int64_t i = 0; i < numIds; ++i) {
+        ids.push_back(i);
+        for (int j = 0; j < dim; ++j) {
+            vectors.push_back(test_util::RandomFloat(-500.0, 500.0));
+        }
+    }
+
+    std::string spaceType = knn_jni::L2;
+    std::string index_description = "HNSW32,SQbf16";
 
     std::unordered_map<std::string, jobject> parametersMap;
     parametersMap[knn_jni::SPACE_TYPE] = (jobject)&spaceType;

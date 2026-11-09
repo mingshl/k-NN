@@ -5,9 +5,11 @@
 
 package org.opensearch.knn.index.query.common;
 
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -18,8 +20,17 @@ import org.apache.lucene.search.join.BitSetProducer;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
+import org.opensearch.common.Nullable;
+import org.opensearch.knn.common.FieldInfoExtractor;
+import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.query.KNNWeight;
+import org.opensearch.knn.index.query.exactsearch.ExactSearcher;
 import org.opensearch.knn.index.query.iterators.GroupedNestedDocIdSetIterator;
+import org.opensearch.knn.indices.ModelDao;
+import org.opensearch.knn.profile.KNNProfileUtil;
+import org.opensearch.knn.profile.query.KNNQueryTimingType;
+import org.opensearch.search.profile.ContextualProfileBreakdown;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -54,11 +65,17 @@ public class QueryUtils {
      * @param topDocs the documents to be retured by the query
      * @return a query representing the given TopDocs
      */
-    public Query createDocAndScoreQuery(final IndexReader reader, final TopDocs topDocs) {
-        return createDocAndScoreQuery(reader, topDocs, null);
+    public Query createDocAndScoreQuery(final IndexReader reader, final TopDocs topDocs, final KNNWeight knnWeight) {
+        return createDocAndScoreQuery(reader, topDocs, knnWeight::explain);
     }
 
-    public Query createDocAndScoreQuery(final IndexReader reader, final TopDocs topDocs, final KNNWeight knnWeight) {
+    /**
+     * Same as {@link #createDocAndScoreQuery(IndexReader, TopDocs, KNNWeight)}, for queries that compute their final
+     * scores themselves and so have no {@link KNNWeight} to explain them.
+     *
+     * @param scoreExplainer explains the score of each returned document, see {@link #exactSearchExplainer}
+     */
+    public Query createDocAndScoreQuery(final IndexReader reader, final TopDocs topDocs, final ScoreExplainer scoreExplainer) {
         int len = topDocs.scoreDocs.length;
         Arrays.sort(topDocs.scoreDocs, Comparator.comparingInt(a -> a.doc));
         int[] docs = new int[len];
@@ -68,7 +85,45 @@ public class QueryUtils {
             scores[i] = topDocs.scoreDocs[i].score;
         }
         int[] segmentStarts = findSegmentStarts(reader, docs);
-        return new DocAndScoreQuery(len, docs, scores, segmentStarts, reader.getContext().id(), knnWeight);
+        return new DocAndScoreQuery(len, docs, scores, segmentStarts, reader.getContext().id(), scoreExplainer);
+    }
+
+    /**
+     * Explains the score of a document returned by a {@link DocAndScoreQuery}.
+     */
+    @FunctionalInterface
+    public interface ScoreExplainer {
+        Explanation explain(LeafReaderContext context, int doc, float score);
+    }
+
+    /**
+     * Explains scores that were computed by an exact search over the field's full precision vectors, in the same
+     * format {@link KNNWeight#explain(LeafReaderContext, int, float)} uses for the native engines.
+     *
+     * The explanation is a short tree: the search type, one detail per step that produced the score, then the
+     * leaf's search type and space type.
+     *
+     * @param field the k-NN field that was searched
+     * @param searchType completes "the type of knn search executed was ...", e.g. {@link KNNConstants#ANN_SEARCH}
+     * @param steps what ran after the approximate search, one short phrase each
+     */
+    public ScoreExplainer exactSearchExplainer(final String field, final String searchType, final String... steps) {
+        return (context, doc, score) -> {
+            final List<Explanation> details = new ArrayList<>(steps.length + 1);
+            for (String step : steps) {
+                details.add(Explanation.match(score, step));
+            }
+            final StringBuilder leafLevelExplanation = new StringBuilder("the type of knn search executed at leaf was ").append(
+                KNNConstants.EXACT_SEARCH
+            );
+            final FieldInfo fieldInfo = FieldInfoExtractor.getFieldInfo(context.reader(), field);
+            if (fieldInfo != null) {
+                final SpaceType spaceType = FieldInfoExtractor.getSpaceType(ModelDao.OpenSearchKNNModelDao.getInstance(), fieldInfo);
+                leafLevelExplanation.append(", spaceType = ").append(spaceType.getValue());
+            }
+            details.add(Explanation.match(score, leafLevelExplanation.toString()));
+            return Explanation.match(score, "the type of knn search executed was " + searchType, details);
+        };
     }
 
     private int[] findSegmentStarts(final IndexReader reader, final int[] docs) {
@@ -182,5 +237,59 @@ public class QueryUtils {
             }
         };
         return BitSet.of(filterIterator, maxDoc);
+    }
+
+    /**
+     * Re-scores an already gathered candidate set of a single leaf against full precision vectors.
+     *
+     * The approximate search may have walked the graph over quantized vectors, so its scores are inexact. This
+     * runs an exact search restricted to the candidates, always over full precision vectors, and reports the
+     * time it took under {@link KNNQueryTimingType#EXACT_SEARCH} when the search is being profiled.
+     *
+     * Only the float, non-radial rescore path is covered, which is what the Lucene engine queries need. The
+     * native engine queries carry extra context (radius, byte vectors, memory optimized search) and go through
+     * {@link org.opensearch.knn.index.query.KNNWeight#exactSearch} instead.
+     *
+     * Deliberately static rather than an instance method: callers that mock this class to stub out the
+     * surrounding search steps still exercise the real context construction here.
+     *
+     * @param exactSearcher the searcher performing the exact search
+     * @param profile breakdown to report the exact search time to, or null when the search is not being profiled
+     * @param leafReaderContext the leaf reader context
+     * @param field the vector field being searched
+     * @param floatQueryVector the full precision query vector
+     * @param matchedDocs the candidates to re-score
+     * @param k the number of results to keep; pass the candidate count to keep all of them
+     * @param parentsFilter when non-null, collapses each parent group to its best scoring child before the
+     *                      top k cut, so k counts parent documents rather than nested field documents
+     * @return the re-scored documents, sorted by descending score, with leaf local document IDs
+     * @throws IOException
+     */
+    public static TopDocs rescoreLeafWithFullPrecision(
+        final ExactSearcher exactSearcher,
+        @Nullable final ContextualProfileBreakdown profile,
+        final LeafReaderContext leafReaderContext,
+        final String field,
+        final float[] floatQueryVector,
+        final DocIdSetIterator matchedDocs,
+        final int k,
+        @Nullable final BitSetProducer parentsFilter
+    ) throws IOException {
+        final ExactSearcher.ExactSearcherContext exactSearcherContext = ExactSearcher.ExactSearcherContext.builder()
+            .matchedDocsIterator(matchedDocs)
+            .numberOfMatchedDocs(matchedDocs.cost())
+            // setting to false because in re-scoring we want to do exact search on full precision vectors
+            .useQuantizedVectorsForSearch(false)
+            .k(k)
+            .field(field)
+            .floatQueryVector(floatQueryVector)
+            .parentsFilter(parentsFilter)
+            .build();
+        return (TopDocs) KNNProfileUtil.profileBreakdown(
+            profile,
+            leafReaderContext,
+            KNNQueryTimingType.EXACT_SEARCH,
+            () -> exactSearcher.searchLeaf(leafReaderContext, exactSearcherContext)
+        );
     }
 }

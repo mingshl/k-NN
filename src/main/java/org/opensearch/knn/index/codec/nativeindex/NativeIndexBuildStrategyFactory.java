@@ -11,8 +11,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.codec.nativeindex.remote.RemoteIndexBuildStrategy;
 import org.opensearch.knn.index.engine.KNNEngine;
-import org.opensearch.knn.index.engine.faiss.FaissSQEncoder;
 import org.opensearch.knn.index.engine.KNNLibraryIndexingContext;
+import org.opensearch.knn.index.engine.Encoder.QuantizationBits;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
 import org.opensearch.repositories.RepositoriesService;
 
@@ -59,13 +59,13 @@ public final class NativeIndexBuildStrategyFactory {
     ) throws IOException {
         final KNNEngine knnEngine = extractKNNEngine(fieldInfo);
         final boolean isTemplate = fieldInfo.attributes().containsKey(MODEL_ID);
-        final boolean iterative = !isTemplate && KNNEngine.FAISS == knnEngine;
-        final boolean isFaissSQOneBitField = FieldInfoExtractor.isSQField(fieldInfo)
-            && FieldInfoExtractor.extractSQConfig(fieldInfo).getBits() == FaissSQEncoder.Bits.ONE.getValue();
+        final boolean iterative = !isTemplate && knnEngine.supportsIterativeBuild();
+        final boolean isFaissSQMosField = FieldInfoExtractor.isSQField(fieldInfo)
+            && QuantizationBits.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits());
 
         // Determine build strategy
         final NativeIndexBuildStrategy strategy;
-        if (isFaissSQOneBitField) {
+        if (isFaissSQMosField) {
             strategy = MemOptimizedScalarQuantizedIndexBuildStrategy.getInstance();
         } else if (iterative) {
             strategy = MemOptimizedNativeIndexBuildStrategy.getInstance();
@@ -74,12 +74,12 @@ public final class NativeIndexBuildStrategyFactory {
         }
 
         initializeVectorValues(knnVectorValues);
-        long vectorBlobLength = ((long) knnVectorValues.bytesPerVector()) * totalLiveDocs;
+        long vectorBlobLength = (long) knnVectorValues.bytesPerVector() * totalLiveDocs;
 
         if (totalLiveDocs > MIN_DOCS_FOR_REMOTE_INDEX_BUILD
             && isKNNRemoteVectorBuildEnabled()
             && knnEngine.supportsRemoteIndexBuild(knnLibraryIndexingContext)
-            && RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, vectorBlobLength)) {
+            && RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, vectorBlobLength, knnVectorValues.dimension())) {
             return new RemoteIndexBuildStrategy(repositoriesServiceSupplier, strategy, indexSettings, knnLibraryIndexingContext);
         } else {
             return strategy;

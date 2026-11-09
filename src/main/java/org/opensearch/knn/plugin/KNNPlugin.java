@@ -32,16 +32,21 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.TieredMergePolicyProvider;
 import org.opensearch.index.codec.CodecServiceFactory;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.mapper.DynamicFieldTypeInferencer;
+import org.opensearch.index.mapper.DynamicTemplateTypeHandler;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.indices.SystemIndexDescriptor;
+import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.engine.KNNEngineContext;
 import org.opensearch.knn.index.KNNCircuitBreaker;
 import org.opensearch.knn.index.KNNVectorDocValueFormat;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNNCodecService;
 import org.opensearch.knn.index.codec.derivedsource.DerivedSourceIndexOperationListener;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
+import org.opensearch.knn.index.mapper.KNNDynamicTemplateTypeHandler;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryLoadStrategy;
@@ -51,6 +56,7 @@ import org.opensearch.knn.index.query.KNNWeight;
 import org.opensearch.knn.index.query.RescoreKNNVectorQuery;
 import org.opensearch.knn.index.query.RescoreRadialSearchQuery;
 import org.opensearch.knn.index.query.exactsearch.ExactSearcher;
+import org.opensearch.knn.index.query.lucenelib.ExpandNestedDocsQuery;
 import org.opensearch.knn.index.query.nativelib.NativeEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.util.KNNClusterUtil;
@@ -67,6 +73,7 @@ import org.opensearch.knn.plugin.rest.RestSearchModelHandler;
 import org.opensearch.knn.plugin.rest.RestTrainModelHandler;
 import org.opensearch.knn.plugin.script.KNNScoringScriptEngine;
 import org.opensearch.knn.plugin.search.KNNConcurrentSearchRequestDecider;
+import org.opensearch.knn.plugin.search.LateInteractionStatsSearchListener;
 import org.opensearch.knn.plugin.stats.KNNStats;
 import org.opensearch.knn.plugin.transport.ClearCacheAction;
 import org.opensearch.knn.plugin.transport.ClearCacheTransportAction;
@@ -106,6 +113,7 @@ import org.opensearch.knn.training.TrainingJobClusterStateListener;
 import org.opensearch.knn.training.TrainingJobRunner;
 import org.opensearch.knn.training.VectorReader;
 import org.opensearch.knn.grpc.proto.request.search.query.KNNQueryBuilderProtoConverter;
+import org.opensearch.lucene.Lucene99ScorerPatcher;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
@@ -136,6 +144,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -215,7 +224,7 @@ public class KNNPlugin extends Plugin
     @Override
     public Optional<ProfileMetricsProvider> getQueryProfileMetricsProvider() {
         return Optional.of((searchContext, query) -> {
-            if (query instanceof KNNQuery || query instanceof RescoreKNNVectorQuery) {
+            if (query instanceof KNNQuery || query instanceof RescoreKNNVectorQuery || query instanceof ExpandNestedDocsQuery) {
                 return KNNMetrics.getKNNQueryMetrics();
             } else if (query instanceof NativeEngineKnnVectorQuery) {
                 return KNNMetrics.getNativeMetrics();
@@ -230,6 +239,16 @@ public class KNNPlugin extends Plugin
             KNNVectorFieldMapper.CONTENT_TYPE,
             new KNNVectorFieldMapper.TypeParser(ModelDao.OpenSearchKNNModelDao::getInstance)
         );
+    }
+
+    @Override
+    public List<DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+        return Collections.singletonList(new KNNDynamicFieldTypeInferencer());
+    }
+
+    @Override
+    public Map<String, DynamicTemplateTypeHandler> getDynamicTemplateTypes() {
+        return Map.of(KNNVectorFieldMapper.CONTENT_TYPE, new KNNDynamicTemplateTypeHandler());
     }
 
     @Override
@@ -254,6 +273,7 @@ public class KNNPlugin extends Plugin
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.repositoriesServiceSupplier = repositoriesServiceSupplier;
+        Lucene99ScorerPatcher.installOnce();
 
         // Initialize Native Memory loading strategies
         VectorReader vectorReader = new VectorReader(client);
@@ -272,6 +292,9 @@ public class KNNPlugin extends Plugin
         KNNWeight.initialize(ModelDao.OpenSearchKNNModelDao.getInstance());
         RescoreRadialSearchQuery.initialize(new ExactSearcher(ModelDao.OpenSearchKNNModelDao.getInstance()));
         TrainingModelRequest.initialize(ModelDao.OpenSearchKNNModelDao.getInstance(), clusterService);
+
+        // Engine discovery runs after the k-NN singletons above are wired so definitions can use them.
+        KNNEngine.initialize(KNNEngineContext.builder().client(client).clusterService(clusterService).build());
 
         clusterService.addListener(TrainingJobClusterStateListener.getInstance());
 
@@ -386,6 +409,7 @@ public class KNNPlugin extends Plugin
     @Override
     public void onIndexModule(IndexModule indexModule) {
         KNNSettings.state().onIndexModule(indexModule);
+        indexModule.addSearchOperationListener(new LateInteractionStatsSearchListener());
         if (KNNSettings.isKNNDerivedSourceEnabled(indexModule.getSettings())) {
             indexModule.addIndexOperationListener(new DerivedSourceIndexOperationListener());
         }
@@ -528,5 +552,13 @@ public class KNNPlugin extends Plugin
         Parameters parameters
     ) {
         return Map.of(MMRRerankProcessor.MMRRerankProcessorFactory.TYPE, new MMRRerankProcessor.MMRRerankProcessorFactory());
+    }
+
+    @Override
+    public void close() throws IOException {
+        // Registered engine definitions release whatever their initialize acquired; best effort, see
+        // KNNEngine#closeEngineDefinitions.
+        KNNEngine.closeEngineDefinitions();
+        super.close();
     }
 }

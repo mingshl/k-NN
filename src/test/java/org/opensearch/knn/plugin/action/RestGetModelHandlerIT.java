@@ -11,19 +11,17 @@
 
 package org.opensearch.knn.plugin.action;
 
-import joptsimple.internal.Strings;
 import lombok.SneakyThrows;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.core.common.Strings;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.plugin.KNNPlugin;
 import org.opensearch.core.rest.RestStatus;
 
-import java.util.Arrays;
-import java.util.List;
 import java.util.Map;
 
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
@@ -96,8 +94,8 @@ public class RestGetModelHandlerIT extends KNNRestTestCase {
         String restURI = String.join("/", KNNPlugin.KNN_BASE_URI, MODELS, modelId);
         Request request = new Request("GET", restURI);
 
-        List<String> filteredPath = Arrays.asList(MODEL_ID, MODEL_DESCRIPTION, MODEL_TIMESTAMP, KNN_ENGINE);
-        request.addParameter("filter_path", Strings.join(filteredPath, ","));
+        String[] filteredPath = { MODEL_ID, MODEL_DESCRIPTION, MODEL_TIMESTAMP, KNN_ENGINE };
+        request.addParameter("filter_path", Strings.arrayToDelimitedString(filteredPath, ","));
 
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
@@ -107,7 +105,7 @@ public class RestGetModelHandlerIT extends KNNRestTestCase {
 
         Map<String, Object> responseMap = createParser(MediaTypeRegistry.getDefaultMediaType().xContent(), responseBody).map();
 
-        assertTrue(responseMap.size() == filteredPath.size());
+        assertTrue(responseMap.size() == filteredPath.length);
         assertEquals(modelId, responseMap.get(MODEL_ID));
         assertEquals(modelDescription, responseMap.get(MODEL_DESCRIPTION));
         assertEquals(FAISS.getName(), responseMap.get(KNN_ENGINE));
@@ -117,12 +115,20 @@ public class RestGetModelHandlerIT extends KNNRestTestCase {
         assertFalse(responseMap.containsKey(MODEL_STATE));
     }
 
+    @SneakyThrows
     public void testGetModel_whenModelIDIsInValid_thenFail() {
         String restURI = String.join("/", KNNPlugin.KNN_BASE_URI, MODELS, "invalid-model-id");
         Request request = new Request("GET", restURI);
 
         ResponseException ex = expectThrows(ResponseException.class, () -> client().performRequest(request));
-        assertTrue(ex.getMessage().contains("\"invalid-model-id\""));
+        assertEquals(RestStatus.NOT_FOUND.getStatus(), ex.getResponse().getStatusLine().getStatusCode());
+
+        // The model index is created lazily by the first put, so before the handler guarded on that this
+        // returned index_not_found_exception unless an earlier test had already trained a model. Assert on
+        // the response body rather than the exception message, which also prefixes the request line.
+        String body = EntityUtils.toString(ex.getResponse().getEntity());
+        assertTrue(body, body.contains("resource_not_found_exception"));
+        assertTrue(body, body.contains("invalid-model-id"));
     }
 
     public void testGetModel_whenIDIsBlank_thenFail() {

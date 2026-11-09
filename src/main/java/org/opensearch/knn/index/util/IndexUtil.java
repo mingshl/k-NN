@@ -73,6 +73,7 @@ public class IndexUtil {
     private static final Version MINIMAL_TOP_LEVEL_ENGINE_FEATURE = Version.V_3_2_0;
     private static final Version MINIMAL_SUPPORTED_VERSION_FOR_NULL_K = Version.V_3_3_0;
     private static final Version MINIMAL_RESCORE_ENABLED_FEATURE = Version.V_3_7_0;
+    private static final Version MINIMAL_GENERIC_METHOD_PARAMETERS_FEATURE = Version.V_3_9_0;
     // public so neural search can access it
     public static final Map<String, Version> minimalRequiredVersionMap = initializeMinimalRequiredVersionMap();
     public static final Set<VectorDataType> VECTOR_DATA_TYPES_NOT_SUPPORTING_ENCODERS = Set.of(VectorDataType.BINARY, VectorDataType.BYTE);
@@ -148,13 +149,13 @@ public class IndexUtil {
 
         // Check field existence
         if (fieldMapping == null) {
-            exception.addValidationError(String.format("Field \"%s\" does not exist.", field));
+            exception.addValidationError(String.format(Locale.ROOT, "Field \"%s\" does not exist.", field));
             return exception;
         }
 
         // Check if field is a map. If not, that is a problem
         if (!(fieldMapping instanceof Map)) {
-            exception.addValidationError(String.format("Field info for \"%s\" is not a map.", field));
+            exception.addValidationError(String.format(Locale.ROOT, "Field info for \"%s\" is not a map.", field));
             return exception;
         }
 
@@ -164,7 +165,9 @@ public class IndexUtil {
         Object type = fieldMap.get("type");
 
         if (!(type instanceof String) || !KNNVectorFieldMapper.CONTENT_TYPE.equals(type)) {
-            exception.addValidationError(String.format("Field \"%s\" is not of type %s.", field, KNNVectorFieldMapper.CONTENT_TYPE));
+            exception.addValidationError(
+                String.format(Locale.ROOT, "Field \"%s\" is not of type %s.", field, KNNVectorFieldMapper.CONTENT_TYPE)
+            );
             return exception;
         }
 
@@ -222,17 +225,17 @@ public class IndexUtil {
             String modelId = (String) fieldMap.get(KNNConstants.MODEL_ID);
 
             if (modelId == null) {
-                exception.addValidationError(String.format("Field \"%s\" does not have a dimension set.", field));
+                exception.addValidationError(String.format(Locale.ROOT, "Field \"%s\" does not have a dimension set.", field));
                 return exception;
             }
 
             if (modelDao == null) {
-                throw new IllegalArgumentException(String.format("Field \"%s\" uses model. modelDao cannot be null.", field));
+                throw new IllegalArgumentException(String.format(Locale.ROOT, "Field \"%s\" uses model. modelDao cannot be null.", field));
             }
 
             ModelMetadata modelMetadata = modelDao.getMetadata(modelId);
             if (!ModelUtil.isModelCreated(modelMetadata)) {
-                exception.addValidationError(String.format("Model \"%s\" for field \"%s\" is not created.", modelId, field));
+                exception.addValidationError(String.format(Locale.ROOT, "Model \"%s\" for field \"%s\" is not created.", modelId, field));
                 return exception;
             }
 
@@ -240,6 +243,7 @@ public class IndexUtil {
             if ((Integer) dimension != expectedDimension) {
                 exception.addValidationError(
                     String.format(
+                        Locale.ROOT,
                         "Field \"%s\" has dimension %d, which is different from " + "dimension specified in the training request: %d",
                         field,
                         dimension,
@@ -256,6 +260,7 @@ public class IndexUtil {
         if ((Integer) dimension != expectedDimension) {
             exception.addValidationError(
                 String.format(
+                    Locale.ROOT,
                     "Field \"%s\" has dimension %d, which is different from " + "dimension specified in the training request: %d",
                     field,
                     dimension,
@@ -441,6 +446,7 @@ public class IndexUtil {
                 put(EXPAND_NESTED, MINIMAL_EXPAND_NESTED_FEATURE);
                 put(KNNConstants.TOP_LEVEL_ENGINE_FEATURE, MINIMAL_TOP_LEVEL_ENGINE_FEATURE);
                 put(KNNConstants.NULL_K, MINIMAL_SUPPORTED_VERSION_FOR_NULL_K);
+                put(KNNConstants.GENERIC_METHOD_PARAMETERS_FEATURE, MINIMAL_GENERIC_METHOD_PARAMETERS_FEATURE);
             }
         };
 
@@ -478,7 +484,7 @@ public class IndexUtil {
             return false;
         }
 
-        if (mapperService.documentMapper().sourceMapper().enabled() == false) {
+        if (mapperService.documentMapper() == null || mapperService.documentMapper().sourceMapper().enabled() == false) {
             return false;
         }
 

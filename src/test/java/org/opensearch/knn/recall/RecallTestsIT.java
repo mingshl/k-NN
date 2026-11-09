@@ -27,6 +27,7 @@ import org.opensearch.knn.index.engine.faiss.QFrameBitEncoder;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -85,7 +86,7 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
     private final static String TRAIN_INDEX_NAME = "train_index";
     private final static String TRAIN_FIELD_NAME = "train_field";
     private final static String TEST_MODEL_ID = "test_model_id";
-    private final static int TEST_DIMENSION = 32;
+    private final static int TEST_DIMENSION = 64;
     private final static int DOC_COUNT = 1100;
     private final static int QUERY_COUNT = 100;
     private final static int TEST_K = 100;
@@ -516,7 +517,7 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
                 TRAIN_FIELD_NAME,
                 TEST_DIMENSION,
                 xContentBuilderToMap(trainingBuilder),
-                String.format("%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
+                String.format(Locale.ROOT, "%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
             );
             assertTrainingSucceeds(TEST_MODEL_ID, 100, 1000 * 5);
 
@@ -593,7 +594,7 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
                 TRAIN_FIELD_NAME,
                 TEST_DIMENSION,
                 xContentBuilderToMap(trainingBuilder),
-                String.format("%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
+                String.format(Locale.ROOT, "%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
             );
             assertTrainingSucceeds(TEST_MODEL_ID, 100, 1000 * 5);
 
@@ -671,7 +672,7 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
                 TRAIN_FIELD_NAME,
                 TEST_DIMENSION,
                 xContentBuilderToMap(trainingBuilder),
-                String.format("%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
+                String.format(Locale.ROOT, "%s-%s", KNNEngine.FAISS.getName(), spaceType.getValue())
             );
             assertTrainingSucceeds(TEST_MODEL_ID, 100, 1000 * 5);
 
@@ -773,7 +774,6 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
                 .field(DIMENSION, TEST_DIMENSION)
                 .startObject(KNN_METHOD)
                 .field(METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
-                .field(KNN_ENGINE, LUCENE_NAME)
                 .field(NAME, METHOD_FLAT)
                 .endObject()
                 .endObject()
@@ -793,7 +793,7 @@ public class RecallTestsIT extends KNNCompressionRestTestCase {
     }
 
     private String createIndexName(KNNEngine knnEngine, SpaceType spaceType) {
-        return String.format("%s_%s_%s", TEST_INDEX_PREFIX_NAME, knnEngine.getName(), spaceType.getValue());
+        return String.format(Locale.ROOT, "%s_%s_%s", TEST_INDEX_PREFIX_NAME, knnEngine.getName(), spaceType.getValue());
     }
 
     @SneakyThrows

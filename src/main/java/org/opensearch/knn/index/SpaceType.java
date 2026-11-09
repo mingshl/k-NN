@@ -248,7 +248,9 @@ public enum SpaceType {
      * @param vectorDataType the given vector data type
      */
     public void validateVectorDataType(VectorDataType vectorDataType) {
-        if (VectorDataType.FLOAT != vectorDataType && VectorDataType.BYTE != vectorDataType) {
+        if (VectorDataType.FLOAT != vectorDataType
+            && VectorDataType.BYTE != vectorDataType
+            && VectorDataType.HALF_FLOAT != vectorDataType) {
             throw new IllegalArgumentException(
                 String.format(Locale.ROOT, "Space type [%s] is not supported with [%s] data type", getValue(), vectorDataType.getValue())
             );
@@ -308,6 +310,8 @@ public enum SpaceType {
      * @return translated distance
      */
     public float scoreToDistanceTranslation(float score) {
-        throw new UnsupportedOperationException(String.format("Space [%s] does not have a score to distance translation", getValue()));
+        throw new UnsupportedOperationException(
+            String.format(Locale.ROOT, "Space [%s] does not have a score to distance translation", getValue())
+        );
     }
 }

@@ -55,13 +55,10 @@ public class NestedDocumentsGenerator extends DocumentsGenerator {
 
     private void generateOneChildDoc(final XContentBuilder builder, final List<float[]> vectors) throws IOException {
         // Vector field
-        if (dataType == VectorDataType.FLOAT) {
-            final float[] vector = SearchTestHelper.generateOneSingleFloatVector(
-                DIMENSIONS,
-                MIN_VECTOR_ELEMENT_VALUE,
-                MAX_VECTOR_ELEMENT_VALUE,
-                false
-            );
+        if (dataType == VectorDataType.FLOAT || dataType == VectorDataType.HALF_FLOAT) {
+            // Pull clustered, graph-friendly vectors from the fixture instead of i.i.d. uniform noise so
+            // remote GPU (CAGRA) builds succeed. See SearchTestHelper#loadClusteredFloatVectors.
+            final float[] vector = SearchTestHelper.getClusteredFloatVector(clusteredFloatVectorCursor++, DIMENSIONS);
             vectors.add(vector);
             builder.startObject().field(KNN_FIELD_NAME, vector).endObject();
         } else if (dataType == VectorDataType.BYTE) {

@@ -1,3 +1,8 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <cstring>
 #include <limits>
 #include <algorithm>
@@ -84,7 +89,7 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_save
           (uint8_t*) queryVecPtr, sizeof(jfloat) * queryVecSize,
           queryVecSize,
           (int64_t*) mmapAddressAndSize, mmapAddressAndSizeLength,
-          nativeFunctionTypeOrd);
+          nativeFunctionTypeOrd, /*docBits=*/1 /* unused by FP16 / BF16 */);
 
       // Release query vector
       JNI_UTIL.ReleasePrimitiveArrayCritical(env, query, queryVecPtr, 0);
@@ -110,11 +115,61 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_sc
     return 0;
 }
 
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_scoreSimilarityInBulkFromFp16Bytes
+  (JNIEnv *env, jclass clazz, jbyteArray fp16Vectors, const jint numVectors, jintArray internalVectorIds, jfloatArray jscores) {
+    if (numVectors <= 0) {
+      return -std::numeric_limits<float>::infinity();
+    }
+
+    try {
+      // The query buffer and similarity function were already set up once by saveSearchContext,
+      // called from the scorer's constructor. Only the vector chunk location needs to be refreshed
+      // here, since (unlike a long-lived mmap region) this Java byte[] is only pinned for this call.
+      SimdVectorSearchContext* srchContext = SimilarityFunction::getSearchContext();
+      if (srchContext == nullptr || srchContext->similarityFunction == nullptr) {
+          throw std::runtime_error("No search context has been initialized, SimdVectorSearchContext* was empty.");
+      }
+
+      jint* vectorIds = JNI_UTIL.GetIntArrayElements(env, internalVectorIds, nullptr);
+      knn_jni::JNIReleaseElements releaseVectorIds {[=]{
+        JNI_UTIL.ReleaseIntArrayElements(env, internalVectorIds, vectorIds, 0);
+      }};
+
+      jfloat* scores = JNI_UTIL.GetFloatArrayElements(env, jscores, nullptr);
+      knn_jni::JNIReleaseElements releaseScores {[=]{
+        JNI_UTIL.ReleaseFloatArrayElements(env, jscores, scores, 0);
+      }};
+
+      // Get raw pointer of `numVectors` FP16-encoded vectors packed contiguously in a plain Java
+      // byte[]. SimdVectorSearchContext addresses vectors purely by (base pointer, byte size), so
+      // this single pinned array works as a one-chunk region holding all `numVectors` vectors.
+      const jsize vectorsByteSize = JNI_UTIL.GetJavaBytesArrayLength(env, fp16Vectors);
+      jbyte* vectorsPtr = static_cast<jbyte*>(JNI_UTIL.GetPrimitiveArrayCritical(env, fp16Vectors, nullptr));
+      knn_jni::JNIReleaseElements releaseVectors {[=]{
+        JNI_UTIL.ReleasePrimitiveArrayCritical(env, fp16Vectors, vectorsPtr, JNI_ABORT);
+      }};
+
+      SimilarityFunction::updateVectorChunk(reinterpret_cast<uint8_t*>(vectorsPtr), vectorsByteSize);
+
+      srchContext->similarityFunction->calculateSimilarityInBulk(
+          srchContext,
+          reinterpret_cast<int32_t*>(vectorIds),
+          reinterpret_cast<float*>(scores),
+          numVectors);
+
+      return *std::max_element(scores, scores + numVectors);
+    } catch (...) {
+      JNI_UTIL.CatchCppExceptionAndThrowJava(env);
+    }
+
+    return 0.0f;
+}
+
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_saveSQSearchContext
   (JNIEnv *env, jclass clazz, jbyteArray quantizedQuery,
    jfloat lowerInterval, jfloat upperInterval, jfloat additionalCorrection,
    jint quantizedComponentSum, jlongArray addressAndSize,
-   jint functionTypeOrd, jint dimension, jfloat centroidDp) {
+   jint functionTypeOrd, jint dimension, jfloat centroidDp, jint docBits) {
     try {
       // Get quantized query bytes
       const jsize queryByteSize = JNI_UTIL.GetJavaBytesArrayLength(env, quantizedQuery);
@@ -137,7 +192,7 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_save
           reinterpret_cast<uint8_t*>(queryPtr), queryByteSize,
           dimension,
           reinterpret_cast<int64_t*>(mmapAddressAndSize), mmapAddressAndSizeLength,
-          functionTypeOrd);
+          functionTypeOrd, docBits);
 
       // Now store correction factors in tmpBuffer (saveSearchContext clears it, then SQ_IP branch leaves it empty)
       SimdVectorSearchContext* ctx = SimilarityFunction::getSearchContext();

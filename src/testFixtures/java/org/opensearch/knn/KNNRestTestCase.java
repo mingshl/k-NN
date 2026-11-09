@@ -225,13 +225,16 @@ public class KNNRestTestCase extends ODFERestTestCase {
     }
 
     private boolean hasExpectRemoteBuildValidation() {
-        try {
-            Method method = this.getClass().getMethod(testName.getMethodName());
-            return method.isAnnotationPresent(ExpectRemoteBuildValidation.class);
-        } catch (NoSuchMethodException e) {
-            // Tests parameterized by @ParametersFactory will throw NoSuchMethodException
-            return false;
+        // testName.getMethodName() includes the @ParametersFactory suffix, e.g. "testCbTripped {compression:X1}".
+        // Strip it to resolve the declared method, then check the annotation on any matching overload.
+        final String rawName = testName.getMethodName();
+        final String baseName = rawName.contains(" ") ? rawName.substring(0, rawName.indexOf(' ')) : rawName;
+        for (Method method : this.getClass().getMethods()) {
+            if (method.getName().equals(baseName) && method.isAnnotationPresent(ExpectRemoteBuildValidation.class)) {
+                return true;
+            }
         }
+        return false;
     }
 
     @SneakyThrows
@@ -260,6 +263,7 @@ public class KNNRestTestCase extends ODFERestTestCase {
         List<Map<String, Object>> nodesStats = parseNodeStatsResponse(responseBody);
         Map<String, Object> node = nodesStats.getFirst();
         String path = String.format(
+            Locale.ROOT,
             "%s.%s.%s",
             StatNames.REMOTE_VECTOR_INDEX_BUILD_STATS.getName(),
             StatNames.CLIENT_STATS.getName(),
@@ -289,6 +293,11 @@ public class KNNRestTestCase extends ODFERestTestCase {
      */
     protected void createKnnIndex(String index, String mapping) throws IOException {
         createIndex(index, getKNNDefaultIndexSettings());
+        putMappingRequest(index, mapping);
+    }
+
+    protected void createTrainingIndex(String index, String mapping) throws IOException {
+        createIndex(index, Settings.builder().put("number_of_shards", 1).put("number_of_replicas", 0).put(KNN_INDEX, false).build());
         putMappingRequest(index, mapping);
     }
 
@@ -1481,20 +1490,29 @@ public class KNNRestTestCase extends ODFERestTestCase {
      */
     @SuppressWarnings("unchecked")
     protected int getTotalGraphsInCache() throws Exception {
+        return getTotalGraphsInCache(null);
+    }
+
+    /**
+     * Total graphs loaded in the native memory cache. When {@code indexName} is non-null, counts only the graphs
+     * for that index; when null, counts graphs across all indices.
+     */
+    protected int getTotalGraphsInCache(final String indexName) throws Exception {
         Response response = getKnnStats(Collections.emptyList(), Collections.emptyList());
         String responseBody = EntityUtils.toString(response.getEntity());
 
         List<Map<String, Object>> nodesStats = parseNodeStatsResponse(responseBody);
 
-        logger.info("[KNN] Node stats:  " + nodesStats);
+        logger.debug("[KNN] Node stats:  " + nodesStats);
 
         return nodesStats.stream()
             .filter(nodeStats -> nodeStats.get(INDICES_IN_CACHE.getName()) != null)
-            .map(nodeStats -> nodeStats.get(INDICES_IN_CACHE.getName()))
+            .map(nodeStats -> (Map<String, Map<String, Object>>) nodeStats.get(INDICES_IN_CACHE.getName()))
             .mapToInt(
-                nodeIndicesStats -> ((Map<String, Map<String, Object>>) nodeIndicesStats).values()
+                nodeIndicesStats -> nodeIndicesStats.entrySet()
                     .stream()
-                    .mapToInt(nodeIndexStats -> (int) nodeIndexStats.get(GRAPH_COUNT))
+                    .filter(entry -> indexName == null || indexName.equals(entry.getKey()))
+                    .mapToInt(entry -> (int) entry.getValue().get(GRAPH_COUNT))
                     .sum()
             )
             .sum();
@@ -2437,14 +2455,14 @@ public class KNNRestTestCase extends ODFERestTestCase {
     protected String createL2PainlessScriptSource(String testField, int dimension, int numDocs) {
         IDVectorProducer idVectorProducer = new IDVectorProducer(dimension, numDocs);
         float[] queryVector = idVectorProducer.getVector(numDocs);
-        return String.format("1/(1 + l2Squared(" + Arrays.toString(queryVector) + ", doc['%s']))", testField);
+        return String.format(Locale.ROOT, "1/(1 + l2Squared(" + Arrays.toString(queryVector) + ", doc['%s']))", testField);
     }
 
     // create painless script source for space_type "l1" by creating query vector based on number of documents
     protected String createL1PainlessScriptSource(String testField, int dimension, int numDocs) {
         IDVectorProducer idVectorProducer = new IDVectorProducer(dimension, numDocs);
         float[] queryVector = idVectorProducer.getVector(numDocs);
-        return String.format("1/(1 + l1Norm(" + Arrays.toString(queryVector) + ", doc['%s']))", testField);
+        return String.format(Locale.ROOT, "1/(1 + l1Norm(" + Arrays.toString(queryVector) + ", doc['%s']))", testField);
     }
 
     /**
@@ -2858,6 +2876,25 @@ public class KNNRestTestCase extends ODFERestTestCase {
     }
 
     /**
+     * Returns true when the BWC old-cluster version still accepts an explicit engine on method=flat.
+     * The reject was introduced in {@link org.opensearch.knn.common.KNNConstants#FLAT_METHOD_ENGINE_AGNOSTIC_VERSION}.
+     * Tests that verify the pre-gate → post-gate BWC path must only run when the old cluster
+     * predates the gate (otherwise the old cluster itself rejects the mapping).
+     */
+    protected boolean isFlatMethodEnginePermittedOnOldCluster(final Optional<String> bwcVersion) {
+        if (bwcVersion.isEmpty()) {
+            return false;
+        }
+        String versionString = bwcVersion.get();
+        if (versionString.endsWith("-SNAPSHOT")) {
+            versionString = versionString.substring(0, versionString.length() - 9);
+        }
+        final Version version = Version.fromString(versionString);
+        return version.onOrAfter(Version.V_3_6_0)
+            && version.before(org.opensearch.knn.common.KNNConstants.FLAT_METHOD_ENGINE_AGNOSTIC_VERSION);
+    }
+
+    /**
      * Generates a random lowercase string with length between MIN_CODE_UNITS and MAX_CODE_UNITS.
      * This method is used for test fixtures to generate random string values that can be used
      * as identifiers, names, or other string-based test data.
@@ -2933,6 +2970,35 @@ public class KNNRestTestCase extends ODFERestTestCase {
         final Map<String, Object> docMap = (Map<String, Object>) responseMap.get(DOCUMENT_FIELD_SOURCE);
 
         return docMap;
+    }
+
+    /**
+     * Bulk-index KNN docs using explicit document ids (preserving the caller's id scheme, e.g. the ids
+     * from a test dataset). Use this instead of the sequential-id overload when a test later references
+     * documents by their original id (update/delete/get).
+     */
+    public void bulkAddKnnDocs(String index, String fieldName, int[] docIds, float[][] indexVectors, int docCount) throws IOException {
+        Request request = new Request("POST", "/_bulk");
+        request.addParameter("refresh", "true");
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < docCount; i++) {
+            sb.append("{ \"index\" : { \"_index\" : \"")
+                .append(index)
+                .append("\", \"_id\" : \"")
+                .append(docIds[i])
+                .append("\" } }\n")
+                .append("{ \"")
+                .append(fieldName)
+                .append("\" : ")
+                .append(Arrays.toString(indexVectors[i]))
+                .append(" }\n");
+        }
+
+        request.setJsonEntity(sb.toString());
+
+        Response response = client().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
     }
 
 }

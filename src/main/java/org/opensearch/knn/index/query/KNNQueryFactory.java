@@ -25,7 +25,6 @@ import java.util.Locale;
 import java.util.Map;
 
 import static org.opensearch.knn.common.KNNConstants.EXPAND_NESTED;
-import static org.opensearch.knn.index.engine.KNNEngine.ENGINES_SUPPORTING_NESTED_FIELDS;
 
 /**
  * Creates the Lucene k-NN queries
@@ -72,7 +71,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
             );
         }
 
-        if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(createQueryRequest.getKnnEngine())) {
+        if (createQueryRequest.getKnnEngine().createsCustomSegmentFiles()) {
             final Query validatedFilterQuery = validateFilterQuerySupport(filterQuery, createQueryRequest.getKnnEngine());
 
             log.debug(
@@ -96,6 +95,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
                         .methodParameters(methodParameters)
                         .filterQuery(validatedFilterQuery)
                         .vectorDataType(vectorDataType)
+                        .spaceType(createQueryRequest.getSpaceType())
                         .rescoreContext(rescoreContext)
                         .shardId(shardId)
                         .isMemoryOptimizedSearch(memoryOptimizedSearchEnabled)
@@ -113,6 +113,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
                         .methodParameters(methodParameters)
                         .filterQuery(validatedFilterQuery)
                         .vectorDataType(vectorDataType)
+                        .spaceType(createQueryRequest.getSpaceType())
                         .rescoreContext(rescoreContext)
                         .shardId(shardId)
                         .isMemoryOptimizedSearch(memoryOptimizedSearchEnabled)
@@ -121,7 +122,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
 
             if (memoryOptimizedSearchEnabled
                 || createQueryRequest.getRescoreContext().isPresent()
-                || (ENGINES_SUPPORTING_NESTED_FIELDS.contains(createQueryRequest.getKnnEngine()) && expandNested)) {
+                || (createQueryRequest.getKnnEngine().supportsNestedFields() && expandNested)) {
                 return new NativeEngineKnnVectorQuery(knnQuery, QueryUtils.getInstance(), expandNested);
             }
 
@@ -152,16 +153,18 @@ public class KNNQueryFactory extends BaseQueryFactory {
             )
         );
 
-        // Skip wrapping with RescoreKNNVectorQuery for expandNested as it will reduce the results to k after rescoring
-        // which will not return all the child documents
-        // TODO: Skip retrieving child docs in ExpandNestedDocsQuery if rescoring is enabled and instead retrieve them after rescoring and
-        // reducing to top K.
-        if (needsRescore && expandNested) {
-            log.warn("Rescoring is not supported when [{}] is set to true", EXPAND_NESTED);
+        if (needsRescore == false) {
             return luceneKnnQuery;
         }
-        return needsRescore ? new RescoreKNNVectorQuery(luceneKnnQuery, fieldName, k, vector, shardId) : luceneKnnQuery;
 
+        // ExpandNestedDocsQuery owns the rescore stage itself, because rescoring has to happen before the child
+        // documents are expanded. Wrapping it here would instead cut to k after the expansion, which counts child
+        // documents rather than parent documents and drops parents that belong in the result.
+        if (expandNested) {
+            return luceneKnnQuery;
+        }
+
+        return new RescoreKNNVectorQuery(luceneKnnQuery, fieldName, k, vector, shardId);
     }
 
     private static int getDimension(float[] floatQueryVector, byte[] byteQueryVector) {
@@ -176,7 +179,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
 
     private static Query validateFilterQuerySupport(final Query filterQuery, final KNNEngine knnEngine) {
         log.debug("filter query {}, knnEngine {}", filterQuery, knnEngine);
-        if (filterQuery != null && KNNEngine.getEnginesThatSupportsFilters().contains(knnEngine)) {
+        if (filterQuery != null && knnEngine.supportsFilters()) {
             return filterQuery;
         }
         return null;
@@ -200,14 +203,14 @@ public class KNNQueryFactory extends BaseQueryFactory {
     ) {
         if (parentFilter == null) {
             assert expandNested == false : "expandNested is allowed to be true only for nested fields.";
-            return vectorDataType == VectorDataType.FLOAT
+            return (vectorDataType == VectorDataType.FLOAT || vectorDataType == VectorDataType.HALF_FLOAT)
                 ? new OSKnnFloatVectorQuery(fieldName, floatQueryVector, luceneK, filterQuery, k, rescoreK)
                 : new OSKnnByteVectorQuery(fieldName, byteQueryVector, luceneK, filterQuery, k);
         }
         // If parentFilter is not null, it is a nested query. Therefore, we delegate creation of query to {@link
         // NestedKnnVectorQueryFactory}
         // which will create query to dedupe search result per parent so that we can get k parent results at the end.
-        return vectorDataType == VectorDataType.FLOAT
+        return (vectorDataType == VectorDataType.FLOAT || vectorDataType == VectorDataType.HALF_FLOAT)
             ? NestedKnnVectorQueryFactory.createNestedKnnVectorQuery(
                 fieldName,
                 floatQueryVector,

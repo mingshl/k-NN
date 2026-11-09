@@ -59,6 +59,72 @@ public class KNN1040ScalarQuantizedVectorScorerTests extends KNNTestCase {
         }
     }
 
+    /**
+     * Multi-bit encodings (B=2, B=4) take the native bulk SIMD path like B=1: the scorer asks
+     * {@code MemorySegmentAddressExtractorUtil} for the raw address of the vector slice. Here the extractor
+     * returns null, so the scorer falls back to Lucene's reference scorer.
+     */
+    @SneakyThrows
+    private void assertMultiBitUsesBulkSimdPath(final ScalarEncoding encoding) {
+        final FlatVectorsScorer mockDelegate = mock(FlatVectorsScorer.class);
+        final KNN1040ScalarQuantizedVectorScorer scorer = new KNN1040ScalarQuantizedVectorScorer(mockDelegate);
+
+        final int dimension = 8;
+        final QuantizedByteVectorValues mockQuantizedValues = mock(QuantizedByteVectorValues.class);
+        when(mockQuantizedValues.dimension()).thenReturn(dimension);
+        when(mockQuantizedValues.getScalarEncoding()).thenReturn(encoding);
+        final IndexInput mockIndexInput = mock(IndexInput.class);
+        when(mockQuantizedValues.getSlice()).thenReturn(mockIndexInput);
+        when(mockIndexInput.length()).thenReturn(1024L);
+
+        // The fallback runs the parent Lucene104ScalarQuantizedVectorScorer, which quantizes the query.
+        final OptimizedScalarQuantizer mockQuantizer = mock(OptimizedScalarQuantizer.class);
+        when(mockQuantizedValues.getQuantizer()).thenReturn(mockQuantizer);
+        when(mockQuantizedValues.getCentroid()).thenReturn(new float[dimension]);
+        final OptimizedScalarQuantizer.QuantizationResult quantizationResult = new OptimizedScalarQuantizer.QuantizationResult(
+            0.0f,
+            1.0f,
+            0.0f,
+            0
+        );
+        when(mockQuantizer.scalarQuantize(any(float[].class), any(byte[].class), anyByte(), any(float[].class))).thenReturn(
+            quantizationResult
+        );
+
+        final StubVectorValues stub = new StubVectorValues();
+        final java.lang.reflect.Field field = StubVectorValues.class.getDeclaredField("quantizedVectorValues");
+        field.setAccessible(true);
+        field.set(stub, mockQuantizedValues);
+
+        try (MockedStatic<MemorySegmentAddressExtractorUtil> mockedStatic = Mockito.mockStatic(MemorySegmentAddressExtractorUtil.class)) {
+            mockedStatic.when(
+                () -> MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(
+                    any(IndexInput.class),
+                    Mockito.anyLong(),
+                    Mockito.anyLong()
+                )
+            ).thenReturn(null);
+
+            final RandomVectorScorer result = scorer.getRandomVectorScorer(VectorSimilarityFunction.EUCLIDEAN, stub, new float[dimension]);
+
+            assertNotNull(result);
+            mockedStatic.verify(
+                () -> MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(mockIndexInput, 0L, 1024L),
+                Mockito.times(1)
+            );
+        }
+    }
+
+    @SneakyThrows
+    public void testGetRandomVectorScorer_whenTwoBitEncoding_thenTriesBulkSimdPath() {
+        assertMultiBitUsesBulkSimdPath(ScalarEncoding.DIBIT_QUERY_NIBBLE);
+    }
+
+    @SneakyThrows
+    public void testGetRandomVectorScorer_whenFourBitEncoding_thenTriesBulkSimdPath() {
+        assertMultiBitUsesBulkSimdPath(ScalarEncoding.PACKED_NIBBLE);
+    }
+
     @SneakyThrows
     public void testGetRandomVectorScorer_whenAddressExtractionReturnsNull_thenFallsBackToLuceneScorer() {
         // Arrange: set up the mock delegate scorer
@@ -74,9 +140,10 @@ public class KNN1040ScalarQuantizedVectorScorerTests extends KNNTestCase {
         when(mockQuantizedValues.getSlice()).thenReturn(mockIndexInput);
         when(mockIndexInput.length()).thenReturn(1024L);
 
-        // Set up quantization mocks needed by the parent Lucene104ScalarQuantizedVectorScorer
+        // Set up quantization mocks needed by the parent Lucene104ScalarQuantizedVectorScorer.
+        // Encoding is SINGLE_BIT_QUERY_NIBBLE (docBits == 1); this test exercises the address-extractor null fallback.
         when(mockQuantizedValues.dimension()).thenReturn(dimension);
-        when(mockQuantizedValues.getScalarEncoding()).thenReturn(ScalarEncoding.UNSIGNED_BYTE);
+        when(mockQuantizedValues.getScalarEncoding()).thenReturn(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
 
         final OptimizedScalarQuantizer mockQuantizer = mock(OptimizedScalarQuantizer.class);
         when(mockQuantizedValues.getQuantizer()).thenReturn(mockQuantizer);
@@ -117,6 +184,58 @@ public class KNN1040ScalarQuantizedVectorScorerTests extends KNNTestCase {
 
             // Assert: the fallback path returns a non-null scorer without throwing
             assertNotNull(result);
+        }
+    }
+
+    /**
+     * Exercises the encoding guard in {@code getScorer}: the scalar encoding is resolved via
+     * {@link ScalarEncodingResolver#docBits}, which every supported width (1, 2, 4) passes on its way to the
+     * native SIMD path. An encoding whose bit width is outside the supported set
+     * (here {@code UNSIGNED_BYTE}, 8 bits) is rejected up front with an
+     * {@link IllegalArgumentException} before any scorer is built.
+     */
+    @SneakyThrows
+    public void testGetRandomVectorScorer_whenScalarEncodingBitWidthUnsupported_thenThrowsIllegalArgumentException() {
+        final FlatVectorsScorer mockDelegate = mock(FlatVectorsScorer.class);
+        final KNN1040ScalarQuantizedVectorScorer scorer = new KNN1040ScalarQuantizedVectorScorer(mockDelegate);
+
+        final int dimension = 8;
+        final QuantizedByteVectorValues mockQuantizedValues = mock(QuantizedByteVectorValues.class);
+        final IndexInput mockIndexInput = mock(IndexInput.class);
+        when(mockQuantizedValues.getSlice()).thenReturn(mockIndexInput);
+        when(mockIndexInput.length()).thenReturn(1024L);
+        when(mockQuantizedValues.dimension()).thenReturn(dimension);
+        // Use an encoding whose bit width (8) is not one of the supported FAISS SQ widths (1, 2, 4)
+        // to trigger the ScalarEncodingResolver#docBits guard.
+        when(mockQuantizedValues.getScalarEncoding()).thenReturn(ScalarEncoding.UNSIGNED_BYTE);
+
+        final StubVectorValues stub = new StubVectorValues();
+        final java.lang.reflect.Field field = StubVectorValues.class.getDeclaredField("quantizedVectorValues");
+        field.setAccessible(true);
+        field.set(stub, mockQuantizedValues);
+
+        final float[] target = new float[dimension];
+        final VectorSimilarityFunction similarityFunction = VectorSimilarityFunction.EUCLIDEAN;
+
+        // Mock the extractor to return a non-null addressAndSize so, absent the encoding guard,
+        // the SIMD path would be entered.
+        try (MockedStatic<MemorySegmentAddressExtractorUtil> mockedStatic = Mockito.mockStatic(MemorySegmentAddressExtractorUtil.class)) {
+            mockedStatic.when(
+                () -> MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(
+                    any(IndexInput.class),
+                    Mockito.anyLong(),
+                    Mockito.anyLong()
+                )
+            ).thenReturn(new long[] { 0L, 1024L });
+
+            final IllegalArgumentException ex = expectThrows(
+                IllegalArgumentException.class,
+                () -> scorer.getRandomVectorScorer(similarityFunction, stub, target)
+            );
+            assertTrue(
+                "Exception message should mention the unsupported encoding, was: " + ex.getMessage(),
+                ex.getMessage().contains("Unsupported SQ scalar encoding") && ex.getMessage().contains("UNSIGNED_BYTE")
+            );
         }
     }
 }

@@ -5,16 +5,21 @@
 
 package org.opensearch.knn.index.engine.lucene;
 
+import java.util.Locale;
+
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.opensearch.common.Nullable;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KnnVectorsFormatContext;
 import org.opensearch.knn.index.codec.LuceneVectorsFormatType;
 import org.opensearch.knn.index.codec.params.KNNScalarQuantizedVectorsFormatParams;
 import org.opensearch.knn.index.engine.CodecFormatResolver;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.index.mapper.CompressionLevel;
 
 import java.util.Map;
 import java.util.function.Function;
@@ -52,7 +57,7 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
     @Override
     public KnnVectorsFormat resolve() {
         throw new UnsupportedOperationException(
-            String.format("%s requires field context, use resolve(field, ...) instead", getClass().getSimpleName())
+            String.format(Locale.ROOT, "%s requires field context, use resolve(field, ...) instead", getClass().getSimpleName())
         );
     }
 
@@ -62,16 +67,37 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         KNNMethodContext methodContext,
         Map<String, Object> params,
         int defaultMaxConnections,
-        int defaultBeamWidth
+        int defaultBeamWidth,
+        ResolvedIndexSpec resolvedSpec,
+        VectorDataType vectorDataType
     ) {
-        LuceneVectorsFormatType formatType = determineFormatType(field, methodContext, params, defaultMaxConnections, defaultBeamWidth);
+        LuceneVectorsFormatType formatType = determineFormatType(
+            field,
+            methodContext,
+            params,
+            defaultMaxConnections,
+            defaultBeamWidth,
+            vectorDataType
+        );
         Function<KnnVectorsFormatContext, KnnVectorsFormat> factory = formatResolvers.get(formatType);
         if (factory == null) {
-            throw new IllegalStateException(String.format("No Lucene vectors format registered for type [%s]", formatType));
+            throw new IllegalStateException(String.format(Locale.ROOT, "No Lucene vectors format registered for type [%s]", formatType));
         }
         final int approximateThreshold = KNNSettings.getApproximateThresholdValue(mapperService);
+        final CompressionLevel compressionLevel = resolvedSpec != null
+            ? resolvedSpec.getCompressionLevel()
+            : CompressionLevel.NOT_CONFIGURED;
         return factory.apply(
-            new KnnVectorsFormatContext(field, methodContext, params, defaultMaxConnections, defaultBeamWidth, approximateThreshold)
+            new KnnVectorsFormatContext(
+                field,
+                methodContext,
+                params,
+                defaultMaxConnections,
+                defaultBeamWidth,
+                approximateThreshold,
+                compressionLevel,
+                vectorDataType
+            )
         );
     }
 
@@ -90,10 +116,11 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         final KNNMethodContext methodContext,
         final Map<String, Object> params,
         final int defaultMaxConnections,
-        final int defaultBeamWidth
+        final int defaultBeamWidth,
+        final VectorDataType vectorDataType
     ) {
         if (METHOD_FLAT.equals(methodContext.getMethodComponentContext().getName())) {
-            log.debug("Initialize KNN vector format for field [{}] with Lucene SQ flat format", field);
+            log.debug("Initialize KNN vector format for field [{}] with flat format (dataType={})", field, vectorDataType);
             return LuceneVectorsFormatType.FLAT;
         }
 

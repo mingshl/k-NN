@@ -8,8 +8,10 @@ package org.opensearch.knn.index.engine.lucene;
 import org.opensearch.Version;
 import org.opensearch.common.ValidationException;
 import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.AbstractMethodResolver;
 import org.opensearch.knn.index.engine.Encoder;
+import org.opensearch.knn.index.engine.Encoder.QuantizationBits;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
@@ -17,38 +19,49 @@ import org.opensearch.knn.index.engine.MethodComponent;
 import org.opensearch.knn.index.engine.MethodComponentContext;
 import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.index.mapper.CompressionLevel;
-import org.opensearch.knn.index.mapper.Mode;
 
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
-import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
-import static org.opensearch.knn.common.KNNConstants.LUCENE_SCALAR_QUANTIZER_DEFAULT_BITS_AFTER_V360;
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
+import static org.opensearch.knn.common.KNNConstants.LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_DEFAULT_BITS;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 import static org.opensearch.knn.index.engine.lucene.LuceneHNSWMethod.HNSW_METHOD_COMPONENT;
 import static org.opensearch.knn.index.engine.lucene.LuceneHNSWMethod.SUPPORTED_ENCODERS;
-import static org.opensearch.knn.index.engine.lucene.LuceneSQEncoder.Bits;
-import static org.opensearch.knn.index.engine.lucene.LuceneSQEncoder.LUCENE_PRE_360_SUPPORTED_SQ_BITS;
-import static org.opensearch.knn.index.engine.lucene.LuceneSQEncoder.LUCENE_SQ_BITS_SUPPORTED;
 
 /**
  * Resolves method configuration for the Lucene HNSW method. Supports optional scalar quantization
- * encoding and {@link org.opensearch.knn.index.mapper.Mode}-based compression resolution, with
- * supported compression levels of {@link org.opensearch.knn.index.mapper.CompressionLevel#x1} and
- * {@link org.opensearch.knn.index.mapper.CompressionLevel#x4}.
+ * encoding and {@link org.opensearch.knn.index.mapper.Mode}-based compression resolution. Supported
+ * compression levels are {@link org.opensearch.knn.index.mapper.CompressionLevel#x1} (raw),
+ * {@link org.opensearch.knn.index.mapper.CompressionLevel#x4} (SQ 7-bit, legacy),
+ * {@link org.opensearch.knn.index.mapper.CompressionLevel#x8} (SQ 4-bit),
+ * {@link org.opensearch.knn.index.mapper.CompressionLevel#x16} (SQ 2-bit), and
+ * {@link org.opensearch.knn.index.mapper.CompressionLevel#x32} (SQ 1-bit). The 1-bit path
+ * requires indices created on or after 3.6.0; the 2/4-bit paths require indices created on or
+ * after {@link org.opensearch.knn.common.KNNConstants#LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION}.
+ *
+ * <p>Those levels are measured against FLOAT's 32-bit storage. {@code half_float} supports x1, x16,
+ * x8 and x4, whose SQ widths are 1/2/4-bit respectively (16 bits down to 1/2/4).
  */
 public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
 
     private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS = Set.of(
         CompressionLevel.x1,
         CompressionLevel.x4,
+        CompressionLevel.x8,
+        CompressionLevel.x16,
         CompressionLevel.x32
+    );
+    private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS_HALF_FLOAT = Set.of(
+        CompressionLevel.x1,
+        CompressionLevel.x4,
+        CompressionLevel.x8,
+        CompressionLevel.x16
     );
 
     @Override
@@ -58,6 +71,10 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
         boolean shouldRequireTraining,
         final SpaceType spaceType
     ) {
+        if (VectorDataType.HALF_FLOAT == knnMethodConfigContext.getVectorDataType()) {
+            return resolveHalfFloatMethod(knnMethodContext, knnMethodConfigContext, shouldRequireTraining, spaceType);
+        }
+
         validateConfig(knnMethodConfigContext, shouldRequireTraining);
         KNNMethodContext resolvedKNNMethodContext = initResolvedKNNMethodContext(
             knnMethodContext,
@@ -73,6 +90,65 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
             knnMethodConfigContext,
             LuceneHNSWMethod.SUPPORTED_ENCODERS
         );
+        validateCompressionConflicts(knnMethodConfigContext.getCompressionLevel(), resolvedCompressionLevel);
+        return ResolvedMethodContext.builder()
+            .knnMethodContext(resolvedKNNMethodContext)
+            .compressionLevel(resolvedCompressionLevel)
+            .build();
+    }
+
+    private ResolvedMethodContext resolveHalfFloatMethod(
+        KNNMethodContext knnMethodContext,
+        KNNMethodConfigContext knnMethodConfigContext,
+        boolean shouldRequireTraining,
+        SpaceType spaceType
+    ) {
+        ValidationException validationException = validateNotTrainingContext(shouldRequireTraining, KNNEngine.LUCENE, null);
+        validationException = validateCompressionSupported(
+            knnMethodConfigContext.getCompressionLevel(),
+            SUPPORTED_COMPRESSION_LEVELS_HALF_FLOAT,
+            KNNEngine.LUCENE,
+            knnMethodConfigContext.getVectorDataType(),
+            validationException
+        );
+        // half_float's encoder configuration (SQ 1/2/4-bit) is fully determined by compression_level
+        // (x16/x8/x4) and auto-resolved internally - there's no tunable parameter surface to expose,
+        // so users configure it via compression_level, not by writing an encoder block themselves.
+        if (isEncoderSpecified(knnMethodContext)) {
+            validationException = validationException == null ? new ValidationException() : validationException;
+            validationException.addValidationError(
+                String.format(
+                    Locale.ROOT,
+                    "\"%s\" parameter is not supported for \"%s\" data type; use \"%s\" instead.",
+                    METHOD_ENCODER_PARAMETER,
+                    VectorDataType.HALF_FLOAT.getValue(),
+                    COMPRESSION_LEVEL_PARAMETER
+                )
+            );
+        }
+        validationException = validateMultiBitCompressionVersion(knnMethodConfigContext, validationException);
+        validationException = validateCompressionNotx1WhenOnDisk(knnMethodConfigContext, validationException);
+        if (validationException != null) {
+            throw validationException;
+        }
+
+        KNNMethodContext resolvedKNNMethodContext = initResolvedKNNMethodContext(
+            knnMethodContext,
+            KNNEngine.LUCENE,
+            spaceType,
+            METHOD_HNSW
+        );
+        resolveEncoder(resolvedKNNMethodContext, knnMethodConfigContext);
+        resolveEncoderBitsAndValidate(knnMethodContext, resolvedKNNMethodContext, knnMethodConfigContext);
+        resolveMethodParams(resolvedKNNMethodContext.getMethodComponentContext(), knnMethodConfigContext, HNSW_METHOD_COMPONENT);
+
+        CompressionLevel resolvedCompressionLevel = isEncoderSpecified(resolvedKNNMethodContext)
+            ? resolveCompressionLevelFromMethodContext(
+                resolvedKNNMethodContext,
+                knnMethodConfigContext,
+                LuceneHNSWMethod.SUPPORTED_ENCODERS
+            )
+            : getDefaultCompressionLevel(knnMethodConfigContext);
         validateCompressionConflicts(knnMethodConfigContext.getCompressionLevel(), resolvedCompressionLevel);
         return ResolvedMethodContext.builder()
             .knnMethodContext(resolvedKNNMethodContext)
@@ -133,21 +209,19 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
             CompressionLevel effectiveCompression = CompressionLevel.isConfigured(knnMethodConfigContext.getCompressionLevel())
                 ? knnMethodConfigContext.getCompressionLevel()
                 : getDefaultCompressionLevel(knnMethodConfigContext);
-            boolean useNewDefault = isV360OrLater
-                && LuceneSQEncoder.Bits.fromValue(LUCENE_SCALAR_QUANTIZER_DEFAULT_BITS_AFTER_V360)
-                    .getCompressionLevel() == effectiveCompression;
-            encoderComponentContext.getParameters()
-                .put(LUCENE_SQ_BITS, useNewDefault ? LUCENE_SCALAR_QUANTIZER_DEFAULT_BITS_AFTER_V360 : LUCENE_SQ_DEFAULT_BITS);
+            // pre-3.6.0 → only the legacy 7-bit path (x4). 3.6.0+ → derive from compression.
+            int resolvedBits = isV360OrLater
+                ? QuantizationBits.fromCompressionLevel(effectiveCompression, knnMethodConfigContext.getVectorDataType()).getValue()
+                : LUCENE_SQ_DEFAULT_BITS;
+            encoderComponentContext.getParameters().put(LUCENE_SQ_BITS, resolvedBits);
         }
         String encoderName = encoderComponentContext.getName();
         Encoder encoder = SUPPORTED_ENCODERS.get(encoderName);
 
-        // Skip the additional validation at the end if not using SQ
-        // TODO: Once validateEncoderParams is defined as an interface method, we can clean this up
-        if (encoder == null || !encoderName.equals(ENCODER_SQ)) {
+        if (encoder == null) {
             return;
         }
-        validateEncoderParams(resolvedKNNMethodContext, knnMethodConfigContext);
+        encoder.validate(resolvedKNNMethodContext, knnMethodConfigContext);
     }
 
     // Method validates for explicit contradictions in the config
@@ -157,120 +231,51 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
             knnMethodConfigContext.getCompressionLevel(),
             SUPPORTED_COMPRESSION_LEVELS,
             KNNEngine.LUCENE,
+            knnMethodConfigContext.getVectorDataType(),
             validationException
         );
+        validationException = validateMultiBitCompressionVersion(knnMethodConfigContext, validationException);
         validationException = validateCompressionNotx1WhenOnDisk(knnMethodConfigContext, validationException);
         if (validationException != null) {
             throw validationException;
         }
     }
 
-    private CompressionLevel getDefaultCompressionLevel(KNNMethodConfigContext knnMethodConfigContext) {
-        if (CompressionLevel.isConfigured(knnMethodConfigContext.getCompressionLevel())) {
-            return knnMethodConfigContext.getCompressionLevel();
+    /**
+     * Rejects the SQ 2-bit and 4-bit levels on the Lucene HNSW method for indices created before
+     * {@link org.opensearch.knn.common.KNNConstants#LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION}: x16 / x8
+     * for FLOAT and x8 / x4 for HALF_FLOAT. The 2-bit and 4-bit scalar-quantization codec files did
+     * not exist in earlier codecs, so an older index cannot read them; reject the mapping up front
+     * rather than deferring to a codec-time failure.
+     */
+    private ValidationException validateMultiBitCompressionVersion(
+        KNNMethodConfigContext knnMethodConfigContext,
+        ValidationException validationException
+    ) {
+        CompressionLevel compressionLevel = knnMethodConfigContext.getCompressionLevel();
+        QuantizationBits bits = QuantizationBits.fromCompressionLevel(compressionLevel, knnMethodConfigContext.getVectorDataType());
+        if (bits != QuantizationBits.TWO && bits != QuantizationBits.FOUR) {
+            return validationException;
         }
-        if (knnMethodConfigContext.getMode() == Mode.ON_DISK) {
-            // Starting with version 3.6, supporting 32x compression by default
-            if (Version.V_3_6_0.onOrBefore(knnMethodConfigContext.getVersionCreated())) {
-                return CompressionLevel.x32;
-            }
-            return CompressionLevel.x4;
+        Version versionCreated = knnMethodConfigContext.getVersionCreated();
+        if (versionCreated == null || versionCreated.onOrAfter(LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION)) {
+            return validationException;
         }
-        return CompressionLevel.x1;
+        validationException = validationException == null ? new ValidationException() : validationException;
+        validationException.addValidationError(
+            String.format(
+                Locale.ROOT,
+                "\"%s\" compression on the [%s] method for engine [%s] requires an index created with version %s or later",
+                compressionLevel.getName(),
+                METHOD_HNSW,
+                KNNEngine.LUCENE.getName(),
+                LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION
+            )
+        );
+        return validationException;
     }
 
-    // TODO: The Encoder interface currently only has validateEncoderConfig() which uses
-    // TrainingConfigValidation* types designed for model training. We should add a general-purpose
-    // validation method to the Encoder interface (e.g. Encoder.validate(KNNMethodContext, KNNMethodConfigContext))
-    // that both Faiss and Lucene resolvers can delegate to, decoupled from training concerns.
-    // See: FaissSQEncoder.validateEncoderConfig() for the Faiss equivalent of this validation.
-    protected static void validateEncoderParams(KNNMethodContext resolvedMethodContext, KNNMethodConfigContext configContext) {
-        if (resolvedMethodContext == null || configContext == null) {
-            return;
-        }
-
-        MethodComponentContext encoderContext = (MethodComponentContext) resolvedMethodContext.getMethodComponentContext()
-            .getParameters()
-            .get(METHOD_ENCODER_PARAMETER);
-        if (encoderContext == null) {
-            return;
-        }
-
-        Map<String, Object> encoderParams = encoderContext.getParameters();
-        Version version = configContext.getVersionCreated();
-        boolean isV360OrLater = version != null && version.onOrAfter(Version.V_3_6_0);
-        Object bitsObj = encoderParams.get(LUCENE_SQ_BITS);
-        Set<String> nonBitParameters = encoderParams.keySet().stream().filter(k -> !k.equals(LUCENE_SQ_BITS)).collect(Collectors.toSet());
-
-        ValidationException validationException = new ValidationException();
-
-        // On 3.6.0+, bits is required when the user explicitly specifies the lucene sq encoder
-        if (isV360OrLater && bitsObj == null) {
-            validationException.addValidationError(
-                String.format(
-                    Locale.ROOT,
-                    "Parameter [%s] is required for encoder [%s] on indices created with version 3.6.0 or later. " + "Supported values: %s",
-                    LUCENE_SQ_BITS,
-                    ENCODER_SQ,
-                    LUCENE_SQ_BITS_SUPPORTED
-                )
-            );
-            throw validationException;
-        }
-
-        if (bitsObj instanceof Integer) {
-            int bits = (Integer) bitsObj;
-
-            // bits=1 does not support other parameters
-            if (bits == Bits.ONE.getValue()) {
-                if (!nonBitParameters.isEmpty()) {
-                    validationException.addValidationError(
-                        String.format(
-                            Locale.ROOT,
-                            "Parameters [%s] are not supported when [%s=%d] for encoder [%s]. "
-                                + "The 1-bit scalar quantization path does not use additional parameters.",
-                            nonBitParameters,
-                            LUCENE_SQ_BITS,
-                            bits,
-                            ENCODER_SQ
-                        )
-                    );
-                    throw validationException;
-                }
-                if (!isV360OrLater) {
-                    validationException.addValidationError(
-                        String.format(
-                            Locale.ROOT,
-                            "Parameter [%s=%d] is only supported for indices created with version 3.6.0 or later. "
-                                + "Supported values: %s",
-                            LUCENE_SQ_BITS,
-                            bits,
-                            LUCENE_PRE_360_SUPPORTED_SQ_BITS
-                        )
-                    );
-                    throw validationException;
-                }
-            }
-
-            // Validate compression level compatibility if explicitly set
-            CompressionLevel configuredCompression = configContext.getCompressionLevel();
-            if (CompressionLevel.isConfigured(configuredCompression)) {
-                CompressionLevel expectedCompression = Bits.fromValue(bits).getCompressionLevel();
-                if (configuredCompression != expectedCompression) {
-                    validationException.addValidationError(
-                        String.format(
-                            Locale.ROOT,
-                            "Compression level [%s] is incompatible with [%s=%d] for encoder [%s]. " + "Expected compression level: [%s]",
-                            configuredCompression.getName(),
-                            LUCENE_SQ_BITS,
-                            bits,
-                            ENCODER_SQ,
-                            expectedCompression.getName()
-                        )
-                    );
-                    throw validationException;
-                }
-            }
-        }
+    private CompressionLevel getDefaultCompressionLevel(KNNMethodConfigContext knnMethodConfigContext) {
+        return getDefaultCompressionLevel(knnMethodConfigContext, CompressionLevel.x4);
     }
 }
